@@ -27,6 +27,7 @@ function renderBotRow(name = 'alpha') {
   const node = (type, props = {}) => ({ type, props })
   const context = {
     BotFace: 'BotFace',
+    Codicon: 'Codicon',
     ContextMenu: 'ContextMenu',
     ContextMenuContent: 'ContextMenuContent',
     ContextMenuItem: 'ContextMenuItem',
