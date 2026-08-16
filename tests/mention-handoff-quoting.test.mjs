@@ -65,7 +65,7 @@ function runHandoffCommand(noteText) {
   return result.stdout.split('\x1f').slice(0, -1)
 }
 
-test('security: a poisoned bot title stays literal in the handoff command', async () => {
+test('security: a poisoned bot title never enters the handoff command', async () => {
   const quoteSentinel = `/tmp/hermes-bot-mode-mention-quote-${process.pid}`
   const subSentinel = `/tmp/hermes-bot-mode-mention-sub-${process.pid}`
   rmSync(quoteSentinel, { force: true })
@@ -77,11 +77,18 @@ test('security: a poisoned bot title stays literal in the handoff command', asyn
   const result = await handler({ text: 'please @ops review the diff' })
   assert.ok(result.text.includes('[@mention handoff'))
 
+  // The dispatch payload is handle-based: the free-text title (which syncs
+  // from ui_meta) never enters any executable command — it only appears in
+  // the human-readable compose instruction, so it cannot inject.
+  const commands = [...result.text.matchAll(/`[^`]*`/g)].map(m => m[0])
+  assert.ok(commands.length > 0, 'expected at least one command in the note')
+  assert.ok(commands.every(cmd => !cmd.includes(title)))
+
   const args = runHandoffCommand(result.text)
   assert.equal(args[args.indexOf('-p') + 1], 'ops')
   assert.equal(
     args[args.indexOf('-q') + 1],
-    `Message from \uD83E\uDD16 ${title} (@research): <your composed message>`
+    `Message from \uD83E\uDD16 research (@research): <your composed message>`
   )
   assert.equal(existsSync(quoteSentinel), false)
   assert.equal(existsSync(subSentinel), false)
@@ -95,13 +102,15 @@ test('security: a hostile active profile name stays literal in the handoff comma
   const { handler } = load({ activeProfile, title: null })
   const result = await handler({ text: 'ask @ops to summarize' })
 
+  // The handle (which is the hostile profile name) must arrive as literal
+  // text: shell-escaped inside the -q payload and single-quoted in the
+  // fleet-dispatch --as argument — never expanded by the shell.
   const args = runHandoffCommand(result.text)
-  // displayName title-cases word boundaries inside the name — the shell
-  // metacharacters survive that transform, so they must arrive escaped.
   assert.equal(
     args[args.indexOf('-q') + 1],
-    `Message from \uD83E\uDD16 Res$(Touch /Tmp/Hbmmention${process.pid})Earch (@${activeProfile}): <your composed message>`
+    `Message from \uD83E\uDD16 ${activeProfile} (@${activeProfile}): <your composed message>`
   )
+  assert.match(result.text, /--as 'res\$\(touch[^']*'/)
   assert.equal(existsSync(sentinel), false)
 })
 
