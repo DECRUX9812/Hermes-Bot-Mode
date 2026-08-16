@@ -596,7 +596,14 @@ if (typeof document !== 'undefined' && !document.getElementById('hermes-bots-ros
     ' display: block !important; width: 100%; min-width: 0; }' +
     '.hermes-scroll-cap > [data-radix-scroll-area-viewport] { max-height: inherit; }' +
     '@keyframes hermes-bots-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }' +
-    '.hermes-bots-pulse { animation: hermes-bots-pulse 1.2s ease-in-out infinite; }'
+    '.hermes-bots-pulse { animation: hermes-bots-pulse 1.2s ease-in-out infinite; }' +
+    // Working pets scurry in place (background-position steps do the run;
+    // this transform adds a light wander so the tile itself feels alive).
+    '@keyframes hermes-bots-pet-wander { 0%,100% { transform: translate(0,0); } 25% { transform: translate(2px,-1px); } 50% { transform: translate(0,1px); } 75% { transform: translate(-2px,-1px); } }' +
+    '.hermes-bots-pet-work { animation: hermes-bots-pet-wander 2.8s ease-in-out infinite; }' +
+    // One-shot pop on a shape avatar when it starts working.
+    '@keyframes hermes-bots-pop { 0% { transform: scale(1); } 40% { transform: scale(1.18); } 100% { transform: scale(1); } }' +
+    '.hb-face-pop { animation: hermes-bots-pop 0.5s ease; }'
   document.head.appendChild(style)
 }
 
@@ -1021,6 +1028,9 @@ function facePose(mood, t) {
   }
 }
 
+/** One-shot pop on the face's wrapper when the mood flips to work. */
+const faceBurstState = new WeakMap()
+
 function paintMathFace(svg, t) {
   const mood = svg.getAttribute('data-hb-mood') || 'idle'
   const shape = svg.getAttribute('data-hb-shape') || 'circle'
@@ -1031,6 +1041,25 @@ function paintMathFace(svg, t) {
   const el = svg.querySelector('[data-hb-el]')
   const er = svg.querySelector('[data-hb-er]')
   const dots = svg.querySelectorAll('[data-hb-dot]')
+
+  // Short action on starting work: scale-pop the row's face wrapper once.
+  let fst = faceBurstState.get(svg)
+
+  if (!fst) {
+    fst = { lastMood: null }
+    faceBurstState.set(svg, fst)
+  }
+
+  if (mood === 'work' && fst.lastMood === 'idle') {
+    const wrap = svg.closest('[data-hb-face-wrap]') || svg.parentElement
+    if (wrap) {
+      wrap.classList.remove('hb-face-pop')
+      void wrap.offsetWidth // restart the animation
+      wrap.classList.add('hb-face-pop')
+    }
+  }
+
+  fst.lastMood = mood
 
   if (body) {
     if (shape === 'cloud') {
@@ -1097,19 +1126,27 @@ function startFaceClock() {
   // The shadow-root walk over the whole document is the expensive part —
   // do it at ~1Hz and paint the cached list per frame. Skip paints while
   // the window is hidden; rAF is throttled there anyway, but be explicit.
+  // Pets ride the same clock: one pass finds both faces and pet tiles.
   let faces = []
+  let pets = []
   let lastScan = -Infinity
 
   const tick = now => {
     if (!document.hidden) {
       if (now - lastScan > 1000) {
         faces = walkMathFaces(document, [])
+        pets = walkPetTiles(document, [])
         lastScan = now
       }
       const t = (now - t0) / 1000
       for (const svg of faces) {
         if (svg.isConnected) {
           paintMathFace(svg, t)
+        }
+      }
+      for (const el of pets) {
+        if (el.isConnected) {
+          paintPetTile(el, t)
         }
       }
     }
@@ -1123,8 +1160,15 @@ function startFaceClock() {
  * Live math face. Photos still use <img>. Shape avatars stay SVG so
  * the clock can move them (a baked PNG cannot).
  */
-function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle' }) {
+function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle', pet = null }) {
   startFaceClock()
+
+  // A pet IS the profile picture — render the live spritesheet so it runs
+  // and jumps while the bot works (falls back to the frame-0 PNG while the
+  // sheet loads, then to a shape avatar if neither is available).
+  if (pet?.sheet) {
+    return jsx(PetSprite, { sheet: pet.sheet, fallback: image || null, size, name, mood })
+  }
 
   if (image) {
     return jsx('img', {
@@ -1463,12 +1507,13 @@ function botAppearance(name, meta) {
   const isPrimary = (name || '').trim().toLowerCase() === 'default'
   const userCustomized = Boolean(meta?.custom)
   if (isPrimary && !userCustomized) {
-    return { shape: 'squircle', color: '#8b5cf6', image: meta?.image || null }
+    return { shape: 'squircle', color: '#8b5cf6', image: meta?.image || null, pet: meta?.pet || null }
   }
   return {
     shape: meta?.shape || defaultShapeFor(name),
     color: meta?.color || profileColor(name),
-    image: meta?.image || null
+    image: meta?.image || null,
+    pet: meta?.pet || null
   }
 }
 
@@ -1567,7 +1612,7 @@ async function generateAvatarImage(bot, title, description) {
  *  Layout uses inline grid styles — arbitrary Tailwind classes like
  *  `grid-cols-7` are NOT in the app's precompiled CSS, which collapsed
  *  this into a single vertical column. */
-function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generateSeed }) {
+function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generateSeed, pet, onPet }) {
   const pickerName = generateSeed?.name || 'agent'
   const imagen = useValue($imagenAvailable)
   const [tab, setTab] = useState('bot')
@@ -1589,11 +1634,17 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
     }
   }
 
+  // A shape/photo/generation is a different look than the pet — any of them
+  // clears the pet identity (the frame-0 PNG may still linger as `image`
+  // until the shape pick replaces it).
+  const clearPet = () => onPet?.(null)
+
   const upload = async () => {
     const raw = await pickImageFromDevice()
 
     if (raw) {
       onImage(await normalizeAvatarImage(raw))
+      clearPet()
     }
   }
 
@@ -1623,6 +1674,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
 
       if (img) {
         onImage(await normalizeAvatarImage(img))
+        clearPet()
       }
     } catch (err) {
       host.notifyError(err, 'Avatar generation failed')
@@ -1662,7 +1714,10 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
             type: 'button',
             variant: 'ghost',
             size: 'sm',
-            onClick: () => onImage(null),
+            onClick: () => {
+              onImage(null)
+              clearPet()
+            },
             children: 'Remove image — use shape'
           })
         : null,
@@ -1691,6 +1746,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                       onClick: () => {
                         onImage(null)
                         onShape(s)
+                        clearPet()
                       },
                       children: jsx(BotFace, { shape: s, color, size: 32, name: pickerName })
                     },
@@ -1715,7 +1771,10 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                         c === color && 'ring-2 ring-(--ui-accent) ring-offset-1 ring-offset-(--ui-bg, transparent)'
                       ),
                       style: { width: 22, height: 22, backgroundColor: c },
-                      onClick: () => onColor(c)
+                      onClick: () => {
+                        onColor(c)
+                        clearPet()
+                      },
                     },
                     c
                   )
@@ -1776,7 +1835,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
           })
         : null,
 
-      tab === 'pet' ? jsx(PetTab, { image, onImage }) : null
+      tab === 'pet' ? jsx(PetTab, { image, onImage, onPet }) : null
     ]
   })
 }
@@ -1868,7 +1927,7 @@ function PetThumb({ spriteUrl, size = 40 }) {
   })
 }
 
-function PetTab({ image, onImage }) {
+function PetTab({ image, onImage, onPet }) {
   // Selection is dialog-local: committed by the dialog's Save like any
   // uploaded/generated image (a direct meta write here gets clobbered by
   // Save's own image state).
@@ -1942,6 +2001,7 @@ function PetTab({ image, onImage }) {
             onClick: () => {
               setSelectedSlug(null)
               onImage(null)
+              onPet?.(null)
             },
             children: 'Remove — back to shape avatar'
           })
@@ -1973,11 +2033,15 @@ function PetTab({ image, onImage }) {
                       onClick: () => {
                         // The pet IS the profile picture: extract frame 0
                         // and hand it to the dialog as the avatar image.
-                        // Persisted when the user hits Save.
+                        // Persisted when the user hits Save. The live pet
+                        // identity (slug + sheet) rides along so the roster
+                        // can animate the full spritesheet instead of a
+                        // frozen frame.
                         setSelectedSlug(pet.slug)
                         void petFrameIcon(pet.spritesheetUrl).then(icon => {
                           if (icon) {
                             onImage(icon)
+                            onPet?.({ slug: pet.slug, sheet: pet.spritesheetUrl })
                           } else {
                             setSelectedSlug(null)
                             host.notify({ kind: 'error', message: 'Could not load that pet — try another.' })
@@ -2006,6 +2070,164 @@ function PetTab({ image, onImage }) {
           })
     ]
   })
+}
+
+// ── live pets: animate the real spritesheet when a bot is working ──────────
+
+// Petdex spritesheet taxonomy (1536×1872 = 8 cols × 9 rows of 192×208):
+// row 0 idle, 1 running-right, 2 running-left, 3 waving, 4 jumping,
+// 5 failed, 6 waiting, 7 running, 8 review. The web app steps 6 frames
+// per state on an 1100ms loop — those exact numbers are the canonical
+// petdex timing (agent/pet/constants.py), so the roster runs in sync
+// with the CLI/TUI pets.
+const PET_STATE_FRAMES = 6
+const PET_LOOP_MS = 1100
+const PET_BURST_S = 2.2 // two jump loops when a bot starts working
+const PET_ROWS = { idle: 0, runRight: 1, runLeft: 2, wave: 3, jump: 4, failed: 5, waiting: 6, run: 7, review: 8 }
+
+/** Which row a pet tile shows: idle stays put, work jumps once then runs.
+ *  Pure — the clock calls it every frame with the element's burst state. */
+function petRowFor(mood, burstActive) {
+  if (mood !== 'work') {
+    return PET_ROWS.idle
+  }
+  return burstActive ? PET_ROWS.jump : PET_ROWS.runRight
+}
+
+/** Frame index inside a state row: 6 frames over PET_LOOP_MS, with a
+ *  per-pet phase offset so the roster never runs in lockstep. Pure. */
+function petFrameIndex(t, seed = 0) {
+  return Math.min(
+    PET_STATE_FRAMES - 1,
+    Math.floor(((t * 1000 + seed) % PET_LOOP_MS) / (PET_LOOP_MS / PET_STATE_FRAMES))
+  )
+}
+
+/** Full-sheet object URLs, cached per spritesheet URL. One ~2MB fetch per
+ *  distinct pet per session; failures are dropped from the cache so a
+ *  transient network error self-heals on the next render. */
+const petSheetCache = new Map()
+
+function petSheetObjectUrl(sheet) {
+  if (!sheet) {
+    return Promise.resolve(null)
+  }
+
+  if (!petSheetCache.has(sheet)) {
+    petSheetCache.set(
+      sheet,
+      fetch(sheet, { signal: AbortSignal.timeout(15000) })
+        .then(resp => resp.blob())
+        .then(blob => URL.createObjectURL(blob))
+        .catch(() => {
+          petSheetCache.delete(sheet)
+          return null
+        })
+    )
+  }
+
+  return petSheetCache.get(sheet)
+}
+
+/** One pet tile: the animated spritesheet stepped by the pet clock.
+ *  `fallback` (the frame-0 PNG data URL) shows until the sheet loads. */
+function PetSprite({ sheet, fallback = null, size = 34, name = 'agent', mood = 'idle' }) {
+  const [url, setUrl] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    petSheetObjectUrl(sheet).then(u => {
+      if (alive) {
+        setUrl(u)
+      }
+    })
+    return () => {
+      alive = false
+    }
+  }, [sheet])
+
+  // Pet frames are 192×208 (taller than square) — keep the aspect ratio so
+  // the pet isn't squashed or cropped like a square avatar tile would.
+  const dw = Math.max(12, Math.round((size * PET_FRAME_W) / PET_FRAME_H))
+
+  if (!url) {
+    return fallback
+      ? jsx('img', {
+          src: fallback,
+          alt: '',
+          'aria-hidden': true,
+          style: { width: size, height: size, borderRadius: '22%', objectFit: 'cover', display: 'block' }
+        })
+      : jsx('div', {
+          style: { width: dw, height: size, borderRadius: 6, background: 'var(--chrome-action-hover, rgba(255,255,255,0.06))', display: 'block' }
+        })
+  }
+
+  return jsx('div', {
+    'data-hb-pet': name || 'pet',
+    'data-hb-mood': mood || 'idle',
+    'data-hb-dw': String(dw),
+    'data-hb-dh': String(size),
+    className: cn('shrink-0', mood === 'work' && 'hermes-bots-pet-work'),
+    style: {
+      width: dw,
+      height: size,
+      backgroundImage: `url(${url})`,
+      backgroundSize: `${dw * 8}px ${size * 9}px`,
+      backgroundPosition: '0 0',
+      backgroundRepeat: 'no-repeat',
+      imageRendering: 'pixelated',
+      display: 'block'
+    }
+  })
+}
+
+/** Per-tile clock state: phase offset + jump-burst window. */
+const petTileState = new WeakMap()
+
+function paintPetTile(el, t) {
+  const mood = el.getAttribute('data-hb-mood') || 'idle'
+  const dw = Number(el.getAttribute('data-hb-dw')) || 31
+  const dh = Number(el.getAttribute('data-hb-dh')) || 34
+  let st = petTileState.get(el)
+
+  if (!st) {
+    const nm = el.getAttribute('data-hb-pet') || ''
+    let h = 0
+    for (let i = 0; i < nm.length; i++) {
+      h = (h * 31 + nm.charCodeAt(i)) >>> 0
+    }
+    st = { seed: h % 997, burstUntil: -Infinity, lastMood: null }
+    petTileState.set(el, st)
+  }
+
+  let burst = false
+
+  if (mood === 'work') {
+    if (st.lastMood !== 'work') {
+      st.burstUntil = t + PET_BURST_S
+    }
+    burst = t < st.burstUntil
+  }
+
+  st.lastMood = mood
+  const row = petRowFor(mood, burst)
+  const frame = petFrameIndex(t, st.seed)
+  el.style.backgroundPosition = `${-(frame * dw)}px ${-(row * dh)}px`
+}
+
+function walkPetTiles(root, acc) {
+  if (!root || !root.querySelectorAll) {
+    return acc
+  }
+
+  root.querySelectorAll('[data-hb-pet]').forEach(node => acc.push(node))
+  root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) {
+      walkPetTiles(el.shadowRoot, acc)
+    }
+  })
+  return acc
 }
 
 // ── data ─────────────────────────────────────────────────────────────────────
@@ -2932,7 +3154,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, openLoops = 0 }) {
   const meta = useValue($botMeta)[bot.name]
   const last = bot.last_session
   const isActive = bot.name === activeProfile
-  const { shape, color, image } = botAppearance(bot.name, meta)
+  const { shape, color, image, pet } = botAppearance(bot.name, meta)
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
@@ -3013,7 +3235,9 @@ function BotRow({ bot, onDelete, onEdit, onGroup, openLoops = 0 }) {
     children: [
       jsx('div', {
         className: 'shrink-0',
-        children: jsx(BotFace, { shape, color, image: photo ? image : null, size: 34, name: bot.name, mood: botMood })
+        // The face clock pops this wrapper once when the bot starts working.
+        'data-hb-face-wrap': pet ? undefined : true,
+        children: jsx(BotFace, { shape, color, image: photo ? image : null, pet, size: 34, name: bot.name, mood: botMood })
       }),
       jsxs('div', {
         className: 'min-w-0 flex-1',
@@ -4014,6 +4238,7 @@ function EditProfileDialog({ bot, open, onClose }) {
   const [shape, setShape] = useState(appearance.shape)
   const [color, setColor] = useState(appearance.color)
   const [image, setImage] = useState(appearance.image)
+  const [pet, setPet] = useState(meta?.pet || null)
   const [title, setTitle] = useState(meta?.title || '')
   const [description, setDescription] = useState(bot?.description || '')
   const [busy, setBusy] = useState(false)
@@ -4029,6 +4254,7 @@ function EditProfileDialog({ bot, open, onClose }) {
       setShape(appearance.shape)
       setColor(appearance.color)
       setImage(appearance.image)
+      setPet(meta?.pet || null)
       setTitle(meta?.title || '')
       setDescription(bot.description || '')
       setBusy(false)
@@ -4053,6 +4279,7 @@ function EditProfileDialog({ bot, open, onClose }) {
       color,
       image,
       imageKind: image ? 'photo' : 'shape',
+      pet: pet || null,
       title: title.trim(),
       custom: true
     })
@@ -4123,15 +4350,17 @@ function EditProfileDialog({ bot, open, onClose }) {
           children: [
             jsx('div', {
               className: 'flex justify-center py-1',
-              children: jsx(BotFace, { shape, color, image, size: 64, name: bot.name })
+              children: jsx(BotFace, { shape, color, image, pet, size: 64, name: bot.name })
             }),
             jsx(AvatarPicker, {
               shape,
               color,
               image,
+              pet,
               onShape: setShape,
               onColor: setColor,
               onImage: setImage,
+              onPet: setPet,
               generateSeed: { name: bot.name, title, description }
             }),
             labeled(
@@ -4198,6 +4427,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const [shape, setShape] = useState('circle')
   const [color, setColor] = useState(AVATAR_COLORS[3])
   const [image, setImage] = useState(null)
+  const [pet, setPet] = useState(null)
   const [advanced, setAdvanced] = useState(false)
   const [cloneFrom, setCloneFrom] = useState('default')
   const [model, setModel] = useState('')
@@ -4384,7 +4614,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
         /* capability application is best-effort */
       }
 
-      saveBotMeta(slug, { shape, color, image, imageKind: image ? 'photo' : 'shape', title: title.trim(), created: Date.now() })
+      saveBotMeta(slug, { shape, color, image, imageKind: image ? 'photo' : 'shape', pet: pet || null, title: title.trim(), created: Date.now() })
       queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
       return slug
     })
@@ -4466,15 +4696,17 @@ function CreateAgentDialog({ open, onClose, roster }) {
           children: [
             jsx('div', {
               className: 'flex justify-center py-1',
-              children: jsx(BotFace, { shape, color, image, size: 56, name: slug || 'agent' })
+              children: jsx(BotFace, { shape, color, image, pet, size: 56, name: slug || 'agent' })
             }),
             jsx(AvatarPicker, {
               shape,
               color,
               image,
+              pet,
               onShape: setShape,
               onColor: setColor,
               onImage: setImage,
+              onPet: setPet,
               generateSeed: { name: slug || 'agent', title, description }
             }),
             labeled(
@@ -5480,7 +5712,7 @@ function RoutinesPane() {
   // roster click and the profile swap landing.
   const bot = (gatewayProfile || selected || 'default').trim() || 'default'
   const meta = useValue($botMeta)[bot]
-  const { shape, color, image } = botAppearance(bot, meta)
+  const { shape, color, image, pet } = botAppearance(bot, meta)
   const { data, error, isLoading, refetch } = useRoutines(bot)
   const [createOpen, setCreateOpen] = useState(false)
   const [createOwner, setCreateOwner] = useState(null)
@@ -5506,7 +5738,7 @@ function RoutinesPane() {
       jsxs('div', {
         className: 'flex items-center gap-2 px-3 pt-3 pb-2',
         children: [
-          jsx(BotFace, { shape, color, image, size: 22, name: bot }),
+          jsx(BotFace, { shape, color, image, pet, size: 22, name: bot }),
           jsxs('div', {
             className: 'min-w-0 flex-1',
             children: [
@@ -5780,7 +6012,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
       }),
       ...active.map(bot => {
         const meta = metaByName?.[bot.name]
-        const { shape, color, image } = botAppearance(bot.name, meta)
+        const { shape, color, image, pet } = botAppearance(bot.name, meta)
         const photo = Boolean(image && !isBackfilledFacePng(image))
         const label = displayName(bot, meta)
 
@@ -5797,6 +6029,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
               shape,
               color,
               image: photo ? image : null,
+              pet,
               size: 24,
               name: bot.name,
               mood: 'work'
@@ -6179,7 +6412,7 @@ function NeedsYou({ roster, unread, meta }) {
         className: 'flex flex-col gap-px pb-1',
         children: items.map(item => {
           const botMeta = meta[item.bot.name] || {}
-          const { shape, color, image } = botAppearance(item.bot.name, botMeta)
+          const { shape, color, image, pet } = botAppearance(item.bot.name, botMeta)
 
           return jsxs(
             'button',
@@ -6189,7 +6422,7 @@ function NeedsYou({ roster, unread, meta }) {
                 'flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)',
               onClick: () => void openBotChat(item.bot, botMeta),
               children: [
-                jsx(BotFace, { shape, color, image, size: 20, name: item.bot.name, mood: 'idle' }),
+                jsx(BotFace, { shape, color, image, pet, size: 20, name: item.bot.name, mood: 'idle' }),
                 jsx('span', {
                   className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
                   children: `@${item.from} →`
