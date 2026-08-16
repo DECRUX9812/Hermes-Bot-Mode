@@ -102,11 +102,27 @@ test('the newest session is selected by last_active, not array position', async 
   assert.deepEqual(JSON.parse(JSON.stringify(r.saved)), [{ name: 'ops', patch: { chat: 'hottest' } }])
 })
 
-test('a pin is not switched without evidence of newer activity', async () => {
+test('without last_active fields, the gateway newest-first order is trusted: a stale pin opens rows[0]', async () => {
   const opened = []
   const r = loadCanonical({
     openSession: async id => opened.push(id),
-    request: sessionList({ id: 'pin', last_active: 0 }, { id: 'other', last_active: 0 })
+    // session.list on this gateway drops the last_active timestamp; the rows
+    // are still ordered newest-first (order_by_last_active) — rows[0] is the
+    // session the roster previews, so the click must open it, not the pin.
+    request: sessionList({ id: 'running' }, { id: 'pin' })
+  })
+
+  assert.equal(await r.openBotCanonicalChat('ops', 'pin'), 'running')
+  assert.deepEqual(opened, ['running'])
+  // The pinned canonical chat stays intact (no silent re-pin).
+  assert.equal(r.saved.length, 0)
+})
+
+test('without last_active fields, a pin that is already rows[0] opens unchanged', async () => {
+  const opened = []
+  const r = loadCanonical({
+    openSession: async id => opened.push(id),
+    request: sessionList({ id: 'pin' }, { id: 'old' })
   })
 
   assert.equal(await r.openBotCanonicalChat('ops', 'pin'), 'pin')

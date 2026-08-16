@@ -2149,18 +2149,26 @@ async function openBotCanonicalChat(name, pinned) {
     // re-pointed when it is genuinely missing from the list (recovery), and
     // selection is by last_active, never array position.
     const pinRow = rows.find(session => session.id === id)
-    const newest = rows.reduce(
-      (best, session) => ((session.last_active || 0) > (best.last_active || 0) ? session : best),
-      rows[0]
-    )
+    // session.list is ordered newest-first by the gateway (order_by_last_active),
+    // but the response only carries a last_active timestamp on newer gateways.
+    // Prefer the timestamp when any row has one; otherwise the gateway's first
+    // row IS the newest — the same session profiles.list reports as
+    // last_session, so opening it is exactly what the row preview promises.
+    const hasActivity = rows.some(session => (session.last_active || 0) > 0)
+    const target = hasActivity
+      ? rows.reduce(
+          (best, session) => ((session.last_active || 0) > (best.last_active || 0) ? session : best),
+          rows[0]
+        )
+      : rows[0]
 
-    if (pinRow && newest.id !== id && (newest.last_active || 0) > (pinRow.last_active || 0)) {
-      // A different session is strictly more recent — open it so the click
-      // matches the row preview, but keep the pinned canonical chat intact.
-      id = newest.id
+    if (pinRow && target.id !== id) {
+      // The previewed (newest) session differs from the pin — open what the
+      // row shows, but keep the pinned canonical chat intact.
+      id = target.id
     } else if (!pinRow) {
       // Pin is gone from the list — recover to the newest known session.
-      id = newest.id
+      id = target.id
       saveBotMeta(name, { chat: id })
     }
   } catch {
