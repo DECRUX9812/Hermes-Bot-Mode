@@ -16,7 +16,7 @@ function sourceBetween(start, end) {
 }
 
 function renderBotRow(name = 'alpha') {
-  const botRowSource = sourceBetween('function BotRow(', '// ── model picker')
+  const botRowSource = sourceBetween('function openTooltip(', '// ── model picker')
   const warmed = []
   const atom = value => ({
     get: () => value,

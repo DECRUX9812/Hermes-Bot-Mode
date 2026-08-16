@@ -132,7 +132,7 @@ function renderRuntime() {
     .replace(/^import .* from 'react'\r?\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat('\nglobalThis.__BotRow = BotRow;')
+    .concat('\nglobalThis.__BotRow = BotRow;\nglobalThis.__openTooltip = openTooltip;')
   vm.runInNewContext(code, context)
   return context
 }
@@ -190,6 +190,32 @@ test('render: BotRow tolerates a fresh bot with no sessions yet', () => {
   assert.match(text, /Fresh bot/)
 })
 
+test('tooltip: names the pinned canonical Bot Chat explicitly', () => {
+  const r = renderRuntime()
+  assert.equal(
+    r.__openTooltip({ id: 's1', title: 'Bot Chat' }, 's1'),
+    'Opens: Bot Chat (canonical)'
+  )
+})
+
+test('tooltip: marks a different latest-active session so the divergence is visible', () => {
+  const r = renderRuntime()
+  assert.equal(
+    r.__openTooltip({ id: 's2', title: 'Premarket' }, 's1'),
+    'Opens: Premarket (latest active)'
+  )
+})
+
+test('tooltip: falls back to the title without a marker when ids are unavailable', () => {
+  const r = renderRuntime()
+  assert.equal(r.__openTooltip({ title: 'Bot Chat' }, 's1'), 'Opens: Bot Chat')
+})
+
+test('tooltip: promises a new Bot Chat when the bot has no sessions yet', () => {
+  const r = renderRuntime()
+  assert.equal(r.__openTooltip(null, undefined), 'Opens: new Bot Chat')
+})
+
 // ── roster search: pure filter over name / handle / title / description ─────
 
 
@@ -198,7 +224,7 @@ test('render: BotRow tolerates a fresh bot with no sessions yet', () => {
 
 
 
-// ── fleet activity: newest-first, capped, DM-attributed ─────────────────────
+// ── recent activity: newest-first, capped, DM-attributed ─────────────────────
 
 function activityOf(roster, limit) {
 }
@@ -352,6 +378,6 @@ test('messagingProtocolSection: documents the hermes chat handoff command', () =
   assert.doesNotMatch(section, /fleet-dispatch/)
 })
 
-// ── fleet page (Phase 3): status ladder + timeline filter ───────────────────
+// ── needs-you: who is waiting on a human, and how long ──────────────────────
 
 

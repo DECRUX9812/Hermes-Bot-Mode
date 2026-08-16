@@ -2136,8 +2136,31 @@ async function openBotCanonicalChat(name, pinned) {
       return createCanonicalChat(name)
     }
 
-    if (!rows.some(session => session.id === id)) {
-      id = rows[0].id
+    // Resolve to the session the roster row actually previews — the bot's
+    // most recently active session — instead of blindly trusting a
+    // possibly-stale pin. A stale pin (its session still exists in the list)
+    // used to win here and open a different chat than the row promised.
+    //
+    // A deliberately pinned canonical Bot Chat is preserved: when the pin is
+    // still the newest session it opens as-is, and when a DIFFERENT session
+    // is strictly more recent (the running one the row shows) we open THAT
+    // without rewriting meta.chat — the canonical identity stays intact and
+    // the row's tooltip says which one you are opening. The pin is only
+    // re-pointed when it is genuinely missing from the list (recovery), and
+    // selection is by last_active, never array position.
+    const pinRow = rows.find(session => session.id === id)
+    const newest = rows.reduce(
+      (best, session) => ((session.last_active || 0) > (best.last_active || 0) ? session : best),
+      rows[0]
+    )
+
+    if (pinRow && newest.id !== id && (newest.last_active || 0) > (pinRow.last_active || 0)) {
+      // A different session is strictly more recent — open it so the click
+      // matches the row preview, but keep the pinned canonical chat intact.
+      id = newest.id
+    } else if (!pinRow) {
+      // Pin is gone from the list — recover to the newest known session.
+      id = newest.id
       saveBotMeta(name, { chat: id })
     }
   } catch {
@@ -2883,6 +2906,19 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
+/** Tooltip for a BotRow button: names the session a click will open and marks
+ *  whether it is the pinned canonical Bot Chat or a different latest-active
+ *  session — the row can never silently promise one chat and open another. */
+function openTooltip(last, pinnedChat) {
+  if (!last) {
+    return 'Opens: new Bot Chat'
+  }
+
+  const marker =
+    last.id && pinnedChat ? (last.id === pinnedChat ? ' (canonical)' : ' (latest active)') : ''
+  return `Opens: ${last.title || 'Untitled session'}${marker}`
+}
+
 function BotRow({ bot, onDelete, onEdit, onGroup, openLoops = 0 }) {
   const activeProfile = useValue(host.state.profile)
   const meta = useValue($botMeta)[bot.name]
@@ -2955,6 +2991,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup, openLoops = 0 }) {
     type: 'button',
     onPointerEnter: warm,
     onClick: open,
+    // The "which session will this open" affordance: hover shows the exact
+    // chat the click resolves to. When the previewed session is the pinned
+    // canonical Bot Chat it says so; when a different (newer) session will
+    // open instead, the row says "latest active" so the divergence is never
+    // silent.
+    title: openTooltip(last, meta?.chat),
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
@@ -6038,7 +6080,7 @@ function openLoopsByBot(roster) {
 
 /** One-glance bot-activity state for the pane's summary strip: what is
  *  happening RIGHT NOW, as plain counts — working, unread, active, paused,
- *  and how many items sit in the Needs-you inbox. Pure (inject `now`) so
+ *  and how many items sit in the Needs-you strip. Pure (inject `now`) so
  *  tests can pin the window logic. */
 
 function fleetSummary(roster, meta, unread, activeProfileName, gatewayBusy, now = Date.now() / 1000) {
@@ -6099,9 +6141,10 @@ function needsYouOf(roster, unread) {
   return out.sort((a, b) => b.ts - a.ts)
 }
 
-/** Human inbox: bot-to-bot replies that arrived unseen (relay them), and
- *  anything that looks like a failed handoff. Loud, small, and honest —
- *  when nothing needs you, this section does not exist. */
+/** Needs-you strip (lightweight preview-based activity, not a full inbox):
+ *  bot-to-bot replies that arrived unseen (relay them), and anything that
+ *  looks like a failed handoff. Loud, small, and honest — when nothing needs
+ *  you, this section does not exist. */
 function NeedsYou({ roster, unread, meta }) {
   const items = needsYouOf(roster, unread)
 
