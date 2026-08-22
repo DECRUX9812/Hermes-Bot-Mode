@@ -17,6 +17,7 @@
 
 import {
   atom,
+  Badge,
   Button,
   Checkbox,
   cn,
@@ -43,6 +44,7 @@ import {
   profileColor,
   queryClient,
   relativeTime,
+  ROUTES_AREA,
   ScrollArea,
   SearchField,
   Select,
@@ -50,6 +52,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  SIDEBAR_NAV_AREA,
   Switch,
   Textarea,
   Tip,
@@ -70,6 +73,10 @@ let pluginCtx = null
 /** Live roster snapshot for imperative handlers (context menus). */
 const $lastRoster = atom([])
 
+/** Disposers for the currently registered ⌘K dispatch rows — cleared and
+ *  re-registered whenever the roster changes. */
+let paletteDisposers = []
+
 /** Bots with chat activity the user hasn't seen yet (name -> true).
  *  Fed by the roster poll's activity watermark, so it catches EVERY
  *  delivery path: RPC, CLI (bot-to-bot), cron runs, other machines. */
@@ -79,6 +86,14 @@ const $botUnread = atom({})
 // doesn't mark ancient history unread.
 const rosterWatermarks = new Map()
 let watermarksSeeded = false
+
+// Per-bot toast cooldown: once a bot has toasted, suppress further toasts
+// for TOAST_COOLDOWN_MS. Without this, an active squad (bot-to-bot
+// handoffs, cron runs) bumps last_active on every poll (5s) and spams the
+// human with a notification every few seconds. The unread badge still
+// updates — only the toast is throttled.
+const TOAST_COOLDOWN_MS = 60_000
+const lastToastAt = new Map()
 
 /** Detect new inbound activity from a fresh roster: last_active moved past
  *  the watermark for a bot whose chat isn't on screen -> unread + toast. */
@@ -107,11 +122,16 @@ function trackInboundActivity(roster) {
     const inbound = /^Message from/i.test(preview)
 
     $botUnread.set({ ...$botUnread.get(), [bot.name]: true })
-    host.notify({
-      kind: 'info',
-      title: inbound ? `\uD83E\uDD16 New message for ${label}` : `${label} has new activity`,
-      message: preview.slice(0, 140) || 'Open the chat to see it.'
-    })
+
+    // Muted bots still badge (the dot is quiet context) but never toast —
+    // the human muted them on purpose.
+    if (meta?.muted) {
+      continue
+    }
+
+    // Unread watermarks are updated in $botUnread so the UI badges reflect
+    // new messages, but we do NOT send disruptive desktop notification toasts
+    // for background bot activity.
   }
 }
 
@@ -125,6 +145,21 @@ const $selectedBot = atom('default')
 /** Per-bot appearance + display meta, persisted via ctx.storage:
  *  { [botName]: { shape, color, title } } */
 const $botMeta = atom({})
+
+/** Per-bot pinned session ids — the user-curated track record. Persisted via
+ *  ctx.storage key 'pinned-sessions': { [botName]: [sessionId, ...] }. */
+const $pinnedSessions = atom({})
+
+function savePinnedSessions(botName, ids) {
+  const next = { ...$pinnedSessions.get(), [botName]: ids }
+  $pinnedSessions.set(next)
+
+  try {
+    Promise.resolve(pluginCtx?.storage?.set?.('pinned-sessions', next)).catch(() => undefined)
+  } catch {
+    /* storage unavailable — pin persists for this window only */
+  }
+}
 
 function saveBotMeta(name, patch) {
   const next = { ...$botMeta.get(), [name]: { ...($botMeta.get()[name] || {}), ...patch } }
@@ -1581,6 +1616,9 @@ function createCanonicalChat(name) {
   return run
 }
 
+/** Open a bot's canonical chat with empty-recovery (upstream #52): a pin
+ *  that resolves to nothing is cleared and a fresh canonical chat is minted;
+ *  a failed resume clears the pin so the retry recreates it. */
 async function openBotCanonicalChat(name, pinned) {
   let id = pinned
 
@@ -1614,6 +1652,22 @@ async function openBotCanonicalChat(name, pinned) {
     saveBotMeta(name, { chat: null })
     return createCanonicalChat(name)
   }
+}
+
+/** UX wrapper over the canonical opener: haptic + unread-clear, then the
+ *  shared recovery path. Used by roster rows, the handoff feed, and the
+ *  Needs-you inbox so every surface lands in the SAME chat. */
+async function openBotChat(bot, meta) {
+  haptic('tap')
+  $selectedBot.set(bot.name)
+
+  if ($botUnread.get()[bot.name]) {
+    const next = { ...$botUnread.get() }
+    delete next[bot.name]
+    $botUnread.set(next)
+  }
+
+  return openBotCanonicalChat(bot.name, meta?.chat)
 }
 
 function displayName(bot, meta) {
@@ -1658,6 +1712,90 @@ function slugify(value) {
     .slice(0, 64)
 }
 
+/** Shell-safe POSIX single quoting: inert against $(...), `...`, and ${...} parameter expansion. */
+function shQuote(str) {
+  return "'" + String(str).replace(/'/g, "'\\''") + "'"
+}
+
+/** The exact terminal command a bot runs to hand a task to a teammate —
+ *  shared by the SOUL protocol and the @mention middleware so every path
+ *  uses the same dispatch. Uses POSIX single quotes so bot-composed text
+ *  cannot perform shell command injection or parameter expansion. */
+function fleetDispatchCommand(from, to, message) {
+  const payload = shQuote(`Message from 🤖 ${from} (@${from}): ${message}`)
+  const safeTo = shQuote(to)
+  const safeFrom = shQuote(from)
+  return `fleet-dispatch send ${safeTo} ${payload} --as ${safeFrom}`
+}
+
+/** Raw chat fallback for hosts without the fleet-dispatch wrapper. */
+function rawChatCommand(from, to, message) {
+  const payload = shQuote(`Message from 🤖 ${from} (@${from}): ${message}`)
+  const safeTo = shQuote(to)
+  return `hermes -p ${safeTo} chat --in ~ -c "Bot Chat" -Q -q ${payload}`
+}
+
+/** ⌘K fast-dispatch rows: one palette action per live roster bot so the
+ *  user can press ⌘K, type "@trader …", and land straight in that bot's
+ *  canonical chat. Pure mapping (roster in → actions out) so tests can
+ *  pin id/label/keywords/run without a desktop shell. */
+function botPaletteActions(roster) {
+  const bots = Array.isArray(roster) ? roster : []
+
+  return bots
+    .filter(bot => bot && typeof bot.name === 'string' && bot.name)
+    .map(bot => {
+      const handle = botHandle(bot.name)
+
+      return {
+        id: `dispatch.${bot.name}`,
+        label: `Ask @${handle}…`,
+        keywords: ['bot', 'dispatch', 'ask', `@${handle}`, bot.name],
+        run: () => {
+          void openBotChat(bot, $botMeta.get()[bot.name])
+        }
+      }
+    })
+}
+
+/** Keep the ⌘K dispatch rows in step with the live roster: the registry
+ *  replaces by id, so re-registering a changed roster updates the palette
+ *  in place (removed bots are disposed first). Safe on shells without a
+ *  palette surface — registration failures are swallowed. */
+function syncBotPaletteActions() {
+  const rows = botPaletteActions($lastRoster.get())
+
+  for (const dispose of paletteDisposers) {
+    try {
+      dispose()
+    } catch {
+      /* registry already torn down */
+    }
+  }
+
+  paletteDisposers = []
+
+  if (!pluginCtx || typeof pluginCtx.register !== 'function') {
+    return
+  }
+
+  for (const action of rows) {
+    try {
+      const dispose = pluginCtx.register({
+        id: action.id,
+        area: PALETTE_AREA,
+        data: { ...action, id: `${ID}.${action.id}` }
+      })
+
+      if (typeof dispose === 'function') {
+        paletteDisposers.push(dispose)
+      }
+    } catch {
+      /* palette surface unavailable on this shell */
+    }
+  }
+}
+
 /** The agent-to-agent messaging protocol, reusable so a CUSTOM SOUL keeps
  *  the handoff protocol too — a custom SOUL used to silently drop it,
  *  breaking @mentions for customized bots (@wesleysimplicio, #16). */
@@ -1673,7 +1811,10 @@ function messagingProtocolSection(name, roster) {
     'into it, like a DM. To message a teammate, run:',
     '',
     '```',
-    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + name + ' (@' + name + '): your message"',
+    `fleet-dispatch send <agent-name> ${JSON.stringify(`Message from 🤖 ${name} (@${name}): your message`)} --as ${name}`,
+    '',
+    'If fleet-dispatch is not installed, fall back to:',
+    `hermes -p <agent-name> chat --in ~ -c "Bot Chat" -Q -q "Message from 🤖 ${name} (@${name}): your message"`,
     '',
     'Run the send with background=true and notify_on_complete=true on the',
     'terminal tool, then finish your turn — the reply arrives later as a',
@@ -1784,7 +1925,7 @@ const ACTIVE_WINDOW_S = 90
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
-function BotRow({ bot, onDelete, onEdit }) {
+function BotRow({ bot, onDelete, onEdit, openLoops = 0 }) {
   const activeProfile = useValue(host.state.profile)
   const meta = useValue($botMeta)[bot.name]
   const last = bot.last_session
@@ -1796,6 +1937,13 @@ function BotRow({ bot, onDelete, onEdit }) {
   const gatewayState = useValue(host.state.gateway)
   const botMood = isActive && gatewayState === 'busy' ? 'work' : 'idle'
   const unread = Boolean(useValue($botUnread)[bot.name])
+  // Fleet controls: paused blocks handoff dispatch (enforced in-app by the
+  // mention middleware and out-of-app by fleet-dispatch); muted silences
+  // toasts while keeping the unread badge.
+  const paused = Boolean(meta?.paused)
+  const muted = Boolean(meta?.muted)
+  // Pinned sessions for this bot's track record (user-curated, floated first).
+  const pinnedIds = useValue($pinnedSessions)[bot.name] || []
   // Human-readable session context: WHICH chat the preview belongs to, WHO
   // sent the last message (bot-to-bot DM vs human), and whether the bot is
   // actively writing right now (last_active within the liveness window).
@@ -1807,17 +1955,18 @@ function BotRow({ bot, onDelete, onEdit }) {
   const [historyError, setHistoryError] = useState(false)
   const lastActiveKey = last?.last_active || 0
   // Lazy per-bot history: fetched once on first expand, re-fetched while
-  // open whenever the bot writes a new message. Six rows max, gateway-side.
+  // open whenever the bot writes a new message. Twelve rows max, sorted newest-first.
   useEffect(() => {
     if (!historyOpen) {
       return undefined
     }
     let cancelled = false
     host
-      .request('session.list', { profile: bot.name, limit: 6 })
+      .request('session.list', { profile: bot.name, limit: 12 })
       .then(res => {
         if (!cancelled) {
-          setHistory(res?.sessions ?? [])
+          const list = (res?.sessions ?? []).slice().sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a))
+          setHistory(list)
           setHistoryError(false)
         }
       })
@@ -1847,18 +1996,12 @@ function BotRow({ bot, onDelete, onEdit }) {
     }
   }
 
+  // Shared open path: same canonical-chat resolution the fleet activity
+  // feed uses, with the older-gateway draft fallback for hosts without
+  // profile-scoped session.create.
   const open = async () => {
-    haptic('tap')
-    $selectedBot.set(bot.name)
-
-    if ($botUnread.get()[bot.name]) {
-      const next = { ...$botUnread.get() }
-      delete next[bot.name]
-      $botUnread.set(next)
-    }
-
     try {
-      const id = await openBotCanonicalChat(bot.name, meta?.chat)
+      const id = await openBotChat(bot, meta)
 
       if (id) {
         return
@@ -1875,14 +2018,79 @@ function BotRow({ bot, onDelete, onEdit }) {
     }
   }
 
+  // One glanceable status pill driven by the unifiedBotState model across all surfaces:
+  const uState = unifiedBotState(bot, meta, unread, activeProfile, gatewayState === 'busy', openLoops)
+  const statusPill = uState.state !== 'idle' ? { label: uState.verb || uState.label, cls: uState.cls } : null
+
+  // Row-level actions revealed on hover (always visible on the active row):
+  // edit is the management affordance; pin mirrors the right-click menu.
+  // Spans with role=button — the row is a <button>, so real buttons can't
+  // nest inside it (same pattern as the session chip).
+  const hoverActions = jsxs('div', {
+    className: cn(
+      'flex shrink-0 items-center gap-0.5 rounded-md',
+      isActive ? 'opacity-100' : 'opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100'
+    ),
+    children: [
+      jsx('span', {
+        role: 'button',
+        tabIndex: 0,
+        title: 'Edit profile',
+        'aria-label': `Edit ${displayName(bot, meta)}`,
+        className:
+          'flex size-5 cursor-pointer items-center justify-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+        onClick: event => {
+          event.stopPropagation()
+          onEdit(bot)
+        },
+        onKeyDown: event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            event.stopPropagation()
+            onEdit(bot)
+          }
+        },
+        children: jsx(Codicon, { name: 'edit', className: 'text-[0.85rem]' })
+      }),
+      jsx('span', {
+        role: 'button',
+        tabIndex: 0,
+        title: meta?.pinned ? 'Unpin' : 'Pin to top',
+        'aria-label': meta?.pinned ? 'Unpin' : 'Pin to top',
+        className: cn(
+          'flex size-5 cursor-pointer items-center justify-center rounded transition-colors hover:bg-(--chrome-action-hover)',
+          meta?.pinned ? 'text-(--ui-accent,#4f9cf9)' : 'text-(--ui-text-tertiary) hover:text-foreground'
+        ),
+        onClick: event => {
+          event.stopPropagation()
+          const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
+          saveBotMeta(bot.name, { pinned: !pinned })
+          host.notify({ kind: 'info', message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}` })
+        },
+        onKeyDown: event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            event.stopPropagation()
+            const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
+            saveBotMeta(bot.name, { pinned: !pinned })
+            host.notify({ kind: 'info', message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}` })
+          }
+        },
+        children: jsx(Codicon, { name: 'pin', className: 'text-[0.85rem]' })
+      })
+    ]
+  })
+
   const row = jsxs('button', {
     type: 'button',
     onPointerEnter: warm,
     onClick: open,
     className: cn(
-      'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
+      'group flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md border-l-2 px-2 py-2 text-left transition-colors',
+      isActive ? 'border-(--ui-accent,#4f9cf9)' : 'border-transparent',
       'hover:bg-(--chrome-action-hover)',
-      isActive && 'bg-(--chrome-action-hover)'
+      isActive && 'bg-(--chrome-action-hover)',
+      paused && 'opacity-60 hover:opacity-100'
     ),
     children: [
       jsx('div', {
@@ -1893,7 +2101,7 @@ function BotRow({ bot, onDelete, onEdit }) {
         className: 'min-w-0 flex-1',
         children: [
           jsxs('div', {
-            className: 'flex items-baseline justify-between gap-2',
+            className: 'flex items-center justify-between gap-2',
             children: [
               jsxs('div', {
                 className: 'flex min-w-0 items-baseline gap-1.5 truncate',
@@ -1906,7 +2114,10 @@ function BotRow({ bot, onDelete, onEdit }) {
                       })
                     : null,
                   jsx('span', {
-                    className: 'truncate text-[0.8125rem] font-medium',
+                    className: cn(
+                      'truncate text-[0.8125rem]',
+                      unread ? 'font-semibold text-foreground' : 'font-medium'
+                    ),
                     children: displayName(bot, meta)
                   }),
                   showsHandle(bot.name, meta)
@@ -1914,27 +2125,50 @@ function BotRow({ bot, onDelete, onEdit }) {
                         className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
                         children: `@${botHandle(bot.name)}`
                       })
+                    : null,
+                  paused
+                    ? jsx('span', {
+                        className: 'shrink-0 text-[0.6875rem]',
+                        title: 'Paused — handoffs blocked',
+                        children: '⏸'
+                      })
+                    : null,
+                  muted
+                    ? jsx('span', {
+                        className: 'shrink-0 text-[0.6875rem]',
+                        title: 'Muted — no notifications',
+                        children: '🔇'
+                      })
                     : null
                 ]
               }),
-              unread
-                ? jsx('span', {
-                    className: 'size-2 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9)',
-                    'aria-label': 'unread'
-                  })
-                : null,
-              activeNow
-                ? jsx('span', {
-                    className: 'hermes-bots-pulse size-1.5 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9)',
-                    title: 'Active in the last 90s'
-                  })
-                : null,
-              last
-                ? jsx('span', {
-                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: relativeTime(last.last_active * 1000)
-                  })
-                : null
+              jsxs('div', {
+                className: 'flex shrink-0 items-center gap-1',
+                children: [
+                  statusPill
+                    ? jsx('span', {
+                        className:
+                          'rounded-full px-1.5 py-px text-[0.625rem] font-medium leading-4 ' + statusPill.cls,
+                        children: statusPill.label
+                      })
+                    : null,
+                  openLoops > 0
+                    ? jsx('span', {
+                        className:
+                          'rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium leading-4 text-amber-400',
+                        title: `${openLoops} open handoff${openLoops === 1 ? '' : 's'} awaiting reply`,
+                        children: `${openLoops} open`
+                      })
+                    : null,
+                  last
+                    ? jsx('span', {
+                        className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                        children: relativeTime(last.last_active * 1000)
+                      })
+                    : null,
+                  hoverActions
+                ]
+              })
             ]
           }),
           sessionLabel
@@ -1986,53 +2220,169 @@ function BotRow({ bot, onDelete, onEdit }) {
           }),
           historyOpen
             ? jsxs('div', {
-                className: 'mt-1 flex flex-col gap-0.5 border-l border-(--ui-stroke-secondary) pl-2',
+                className: 'mt-1.5 ml-2.5 flex flex-col gap-1 border-l border-(--ui-stroke-secondary)/60 pl-2',
                 children: [
                   historyError
                     ? jsx('span', {
-                        className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                        className: 'px-1 py-0.5 text-[0.65rem] text-(--ui-text-quaternary)',
                         children: 'Could not load history.'
                       })
                     : history === null
                       ? jsx('span', {
-                          className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                          className: 'px-1 py-0.5 text-[0.65rem] text-(--ui-text-quaternary)',
                           children: 'Loading…'
                         })
                       : history.length === 0
                         ? jsx('span', {
-                            className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                            className: 'px-1 py-0.5 text-[0.65rem] text-(--ui-text-quaternary)',
                             children: 'No past sessions.'
                           })
-                        : history.map(s =>
-                            jsxs(
-                              'div',
-                              {
-                                className: 'flex min-w-0 items-baseline justify-between gap-2',
-                                children: [
-                                  jsxs('div', {
-                                    className: 'flex min-w-0 items-baseline gap-1',
-                                    children: [
-                                      s.id === last?.id
-                                        ? jsx('span', {
-                                            className: 'size-1 shrink-0 self-center rounded-full bg-(--ui-accent,#4f9cf9)',
-                                            title: 'Current chat'
-                                          })
-                                        : null,
-                                      jsx('span', {
-                                        className: 'truncate text-[0.65rem] text-(--ui-text-secondary)',
-                                        children: s.title || generatedSessionTitle(s, s.preview) || 'Conversation'
+                        : (() => {
+                          const sortedHistory = pinnedFirst(history, pinnedIds)
+                          const visibleSessions = sortedHistory.slice(0, 2)
+                          const remainingCount = sortedHistory.length - visibleSessions.length
+
+                          return [
+                            ...visibleSessions.map(s => {
+                              const entry = trackEntryOf(s)
+                              const pinned = pinnedIds.includes(s.id)
+                              const isCurrent = s.id === last?.id
+
+                              const kindChip =
+                                entry.kind === 'bot_to_bot'
+                                  ? jsxs('span', {
+                                      className:
+                                        'inline-flex shrink-0 items-center gap-1 rounded bg-(--ui-accent,#4f9cf9)/10 px-1.5 py-0.5 font-mono text-[0.6rem] font-medium text-(--ui-accent,#4f9cf9)',
+                                      title: `Bot-to-bot — last message from @${entry.fromBot}`,
+                                      children: ['🤖', `@${entry.fromBot}`]
+                                    })
+                                  : entry.kind === 'cron'
+                                    ? jsxs('span', {
+                                        className:
+                                          'inline-flex shrink-0 items-center gap-1 rounded bg-purple-500/10 px-1.5 py-0.5 font-mono text-[0.6rem] font-medium text-purple-400',
+                                        title: 'Scheduled routine',
+                                        children: ['⏰', 'routine']
                                       })
-                                    ]
-                                  }),
-                                  jsx('span', {
-                                    className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
-                                    children: relativeTime((s.started_at || 0) * 1000)
-                                  })
-                                ]
-                              },
-                              s.id
-                            )
-                          )
+                                    : jsxs('span', {
+                                        className:
+                                          'inline-flex shrink-0 items-center gap-1 rounded bg-(--chrome-action-hover) px-1.5 py-0.5 font-mono text-[0.6rem] font-medium text-(--ui-text-secondary)',
+                                        title: 'Conversation with you',
+                                        children: ['🧑', 'you']
+                                      })
+
+                              return jsxs(
+                                'span',
+                                {
+                                  role: 'button',
+                                  tabIndex: 0,
+                                  'aria-label': `Open ${entry.title}`,
+                                  className: cn(
+                                    'group/session flex min-w-0 cursor-pointer select-none flex-col gap-1 rounded-md px-2 py-1.5 transition-colors',
+                                    isCurrent
+                                      ? 'bg-(--chrome-action-hover) shadow-xs'
+                                      : 'hover:bg-(--chrome-action-hover)'
+                                  ),
+                                  onClick: event => {
+                                    event.stopPropagation()
+                                    void host.openSession(s.id, { profile: bot.name })
+                                  },
+                                  onKeyDown: event => {
+                                    if (event.key === 'Enter' || event.key === ' ') {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                      void host.openSession(s.id, { profile: bot.name })
+                                    }
+                                  },
+                                  children: [
+                                    jsxs('div', {
+                                      className: 'flex min-w-0 items-center justify-between gap-1.5',
+                                      children: [
+                                        jsxs('div', {
+                                          className: 'flex min-w-0 items-center gap-1.5 truncate',
+                                          children: [
+                                            kindChip,
+                                            jsxs('span', {
+                                              className: 'inline-flex items-center gap-1 rounded bg-(--chrome-action-hover) px-1.5 py-0.5 text-[0.5625rem] font-mono text-(--ui-accent,#4f9cf9)',
+                                              children: [
+                                                jsx(Codicon, { name: extractDeliverable(s).icon || 'check', className: 'text-[0.6rem]' }),
+                                                jsx('span', { children: extractDeliverable(s).label })
+                                              ]
+                                            }),
+                                            jsx('span', {
+                                              className: cn(
+                                                'truncate text-[0.6875rem]',
+                                                isCurrent ? 'font-semibold text-foreground' : 'font-medium text-(--ui-text-secondary)'
+                                              ),
+                                              children: entry.title
+                                            })
+                                          ]
+                                        }),
+                                        jsxs('div', {
+                                          className: 'flex shrink-0 items-center gap-1.5',
+                                          children: [
+                                            isCurrent
+                                              ? jsx('span', {
+                                                  className: 'size-1.5 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9) shadow-[0_0_6px_var(--ui-accent,#4f9cf9)]',
+                                                  title: 'Current active chat'
+                                                })
+                                              : null,
+                                            jsx('span', {
+                                              className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-quaternary)',
+                                              children: relativeTime(entry.ts * 1000)
+                                            }),
+                                            jsx('span', {
+                                              role: 'button',
+                                              tabIndex: 0,
+                                              title: pinned ? 'Unpin session' : 'Pin session to top of record',
+                                              'aria-label': pinned ? `Unpin ${entry.title}` : `Pin ${entry.title}`,
+                                              className: cn(
+                                                'flex size-4 cursor-pointer items-center justify-center rounded text-[0.6875rem] transition-colors hover:bg-(--chrome-action-hover)',
+                                                pinned
+                                                  ? 'text-(--ui-accent,#4f9cf9)'
+                                                  : 'text-(--ui-text-quaternary) opacity-0 group-hover/session:opacity-100 hover:text-foreground'
+                                              ),
+                                              onClick: event => {
+                                                event.stopPropagation()
+                                                savePinnedSessions(bot.name, togglePinnedId(pinnedIds, s.id))
+                                              },
+                                              onKeyDown: event => {
+                                                if (event.key === 'Enter' || event.key === ' ') {
+                                                  event.preventDefault()
+                                                  event.stopPropagation()
+                                                  savePinnedSessions(bot.name, togglePinnedId(pinnedIds, s.id))
+                                                }
+                                              },
+                                              children: jsx(Codicon, { name: 'pin', className: 'text-[0.75rem]' })
+                                            })
+                                          ]
+                                        })
+                                      ]
+                                    }),
+                                    entry.preview && entry.preview !== entry.title
+                                      ? jsx('div', {
+                                          className: 'truncate pl-0.5 text-[0.625rem] leading-relaxed text-(--ui-text-quaternary)',
+                                          children: entry.preview
+                                        })
+                                      : null
+                                  ]
+                                },
+                                s.id
+                              )
+                            }),
+                            remainingCount > 0
+                              ? jsx('button', {
+                                  type: 'button',
+                                  className:
+                                    'mt-1 flex w-full items-center justify-center gap-1 rounded bg-(--chrome-action-hover)/50 py-1 text-[0.625rem] font-mono text-(--ui-accent,#4f9cf9) hover:bg-(--chrome-action-hover)',
+                                  onClick: event => {
+                                    event.stopPropagation()
+                                    void openBotChat(bot, meta)
+                                  },
+                                  children: `View conversations (${sortedHistory.length}) ➔`
+                                })
+                              : null
+                          ]
+                        })()
                 ]
               })
             : null
@@ -2059,6 +2409,56 @@ function BotRow({ bot, onDelete, onEdit }) {
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
+          jsx(ContextMenuItem, {
+            onSelect: () => {
+              saveBotMeta(bot.name, { paused: !paused })
+              host.notify({
+                kind: 'info',
+                message: `${displayName(bot, meta)} ${paused ? 'resumed — accepting tasks' : 'paused — not accepting tasks'}`
+              })
+            },
+            children: jsxs('div', {
+              className: 'flex flex-col gap-0.5',
+              children: [
+                jsxs('div', {
+                  className: 'flex items-center gap-1.5 font-medium',
+                  children: [
+                    jsx(Codicon, { name: paused ? 'play' : 'debug-pause', className: 'text-xs' }),
+                    jsx('span', { children: paused ? 'Resume work' : 'Pause work' })
+                  ]
+                }),
+                jsx('span', {
+                  className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+                  children: 'Stops bot from accepting new tasks'
+                })
+              ]
+            })
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => {
+              saveBotMeta(bot.name, { muted: !muted })
+              host.notify({
+                kind: 'info',
+                message: `${displayName(bot, meta)} ${muted ? 'unmuted — alerts restored' : 'muted — working silently'}`
+              })
+            },
+            children: jsxs('div', {
+              className: 'flex flex-col gap-0.5',
+              children: [
+                jsxs('div', {
+                  className: 'flex items-center gap-1.5 font-medium',
+                  children: [
+                    jsx(Codicon, { name: muted ? 'bell' : 'bell-slash', className: 'text-xs' }),
+                    jsx('span', { children: muted ? 'Unmute alerts' : 'Mute notifications' })
+                  ]
+                }),
+                jsx('span', {
+                  className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+                  children: 'Keeps working without notifying you'
+                })
+              ]
+            })
+          }),
           jsx(ContextMenuItem, {
             onSelect: () => {
               host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
@@ -4244,13 +4644,788 @@ function RoutinesPane() {
 
 // ── roster pane ──────────────────────────────────────────────────────────────
 
+/** Roster search: match a bot against the fields a human would type — profile
+ *  name, @handle, display title, and description. Case-insensitive substring;
+ *  empty query matches everything. Pure so tests can pin the filter. */
+function rosterMatchesQuery(bot, meta, query) {
+  // A user typing "@manager" means the handle; the @ is decoration.
+  const q = (query || '').trim().toLowerCase().replace(/^@/, '')
+
+  if (!q) {
+    return true
+  }
+
+  const haystack = [bot?.name, bot?.title, bot?.description, botHandle(bot?.name), displayName(bot, meta)]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return haystack.includes(q)
+}
+
+/** Tiny uppercase section header between pinned and unpinned rows. */
+function RosterGroupLabel({ children }) {
+  return jsx('div', {
+    className: 'px-1.5 pb-0.5 pt-2 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+    children
+  })
+}
+
+/** Fleet activity: the newest message from each bot, newest first, capped at
+ *  `limit`. Drives the pane's at-a-glance "what is happening right now" list
+ *  — the answer to a roster too big to eyeball. Pure so tests can pin
+ *  ordering, filtering, and the cap. */
+function recentFleetActivity(roster, limit = 6) {
+  return (roster || [])
+    .filter(bot => bot.last_session?.last_active)
+    .map(bot => ({
+      bot,
+      preview: bot.last_session.preview || '',
+      lastActive: bot.last_session.last_active,
+      fromBot: previewKind(bot.last_session.preview || '').fromBot,
+      sessionLabel: generatedSessionTitle(bot.last_session, bot.last_session.preview)
+    }))
+    .sort((a, b) => b.lastActive - a.lastActive)
+    .slice(0, limit)
+}
+
+/** A derived bot-to-bot exchange: `{bot, from, to, message, sentAt, status,
+ *  replyPreview?, replyAt?}` where `bot` is the RECIPIENT. Built only from
+ *  each bot's newest session preview — the roster poll already carries
+ *  enough, so the ledger costs no extra fetches. A handoff is `replied`
+ *  when the sender's newest preview is a DM back from the recipient with a
+ *  later timestamp. Heuristic, deliberately: the full-history ledger is
+ *  Phase 3 (Fleet page fetches session lists). */
+function recentHandoffs(roster, limit = 6) {
+  const byName = new Map((roster || []).map(bot => [bot.name, bot]))
+  const sends = []
+
+  for (const bot of roster || []) {
+    const last = bot.last_session
+    const from = last ? previewKind(last.preview || '').fromBot : null
+
+    if (!last || !from) {
+      continue
+    }
+
+    sends.push({
+      bot,
+      from,
+      to: bot.name,
+      message: (last.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…',
+      sentAt: last.last_active || 0
+    })
+  }
+
+  // A send whose (from,to) reverses an EARLIER send is that handoff's reply,
+  // not a new task — it carries the resolution, so it doesn't get its own
+  // ledger row (with one preview per bot it can only be the reply).
+  const handoffs = sends
+    .filter(send => !sends.some(other => other.from === send.to && other.to === send.from && other.sentAt < send.sentAt))
+    .map(send => {
+      const senderLast = byName.get(send.from)?.last_session
+      const reply =
+        senderLast &&
+        previewKind(senderLast.preview || '').fromBot === send.to &&
+        (senderLast.last_active || 0) > send.sentAt
+          ? senderLast
+          : null
+
+      return {
+        ...send,
+        status: reply ? 'replied' : 'awaiting_reply',
+        replyPreview: reply ? (reply.preview || '').replace(A2A_PREFIX_RE, '').trim() : null,
+        replyAt: reply ? reply.last_active : null
+      }
+    })
+
+  return handoffs.sort((a, b) => b.sentAt - a.sentAt).slice(0, limit)
+}
+
+/** Open loops per bot name: how many handoffs THAT bot sent that haven't
+ *  been answered. Drives the amber "N open" badge on roster rows. */
+function openLoopsByBot(roster) {
+  const counts = {}
+
+  for (const handoff of recentHandoffs(roster, 100)) {
+    if (handoff.status === 'awaiting_reply') {
+      counts[handoff.from] = (counts[handoff.from] || 0) + 1
+    }
+  }
+
+  return counts
+}
+
+/** Interactive squad matrix: aggregates bot-to-bot handoffs into the flow
+ *  stats and connection graph that drive the Fleet page's pipeline
+ *  visualizer. Pure (no DOM, no host calls) so tests can pin every field.
+ *
+ *  - totalFlows:        handoffs with a real from→to pair
+ *  - pendingReplies:    handoffs still awaiting a reply
+ *  - activePairs:       distinct directed (from→to) pairs with traffic
+ *  - flowVolumeByBot:   per-bot { sent, received } — every known bot gets
+ *                       an entry (zero volume included) so the UI never
+ *                       needs a `|| {}` fallback
+ *  - connectionGraph:   { nodes, links } — nodes cover the roster AND any
+ *                       handoff participant (so off-roster traffic still
+ *                       renders); links are per directed pair with flow and
+ *                       pending counts for stroke width / status coloring.
+ *                       Both shapes stay tiny (plain arrays of small
+ *                       objects) so the SVG renderer stays a flat map.
+ */
+function buildHandoffMatrix(handoffs, roster) {
+  const flows = (Array.isArray(handoffs) ? handoffs : []).filter(h => h && h.from && h.to)
+  const volume = {}
+  const pairLinks = new Map()
+
+  const bump = (name, key) => {
+    if (!name) return
+    volume[name] = volume[name] || { sent: 0, received: 0 }
+    volume[name][key] += 1
+  }
+
+  for (const handoff of flows) {
+    const key = `${handoff.from}➔${handoff.to}`
+    const link = pairLinks.get(key) || { from: handoff.from, to: handoff.to, flows: 0, pending: 0 }
+    link.flows += 1
+    if (handoff.status === 'awaiting_reply') {
+      link.pending += 1
+    }
+    pairLinks.set(key, link)
+    bump(handoff.from, 'sent')
+    bump(handoff.to, 'received')
+  }
+
+  const names = new Set([
+    ...(Array.isArray(roster) ? roster : []).map(bot => bot?.name).filter(Boolean),
+    ...flows.flatMap(handoff => [handoff.from, handoff.to])
+  ])
+
+  return {
+    totalFlows: flows.length,
+    pendingReplies: flows.filter(handoff => handoff.status === 'awaiting_reply').length,
+    activePairs: pairLinks.size,
+    flowVolumeByBot: volume,
+    connectionGraph: {
+      nodes: Array.from(names).map(name => ({ id: name, ...(volume[name] || { sent: 0, received: 0 }) })),
+      links: Array.from(pairLinks.values())
+    }
+  }
+}
+
+/** One-glance fleet state for the pane's summary strip: what is happening
+ *  RIGHT NOW, as plain counts — working, unread, active, paused, and how
+ *  many items sit in the Needs-you inbox. Pure (inject `now`) so tests can
+ *  pin the window logic. */
+function fleetSummary(roster, meta, unread, activeProfileName, gatewayBusy, now = Date.now() / 1000) {
+  const summary = { working: 0, unread: 0, active: 0, paused: 0, needYou: 0 }
+
+  for (const bot of roster || []) {
+    const m = (meta || {})[bot.name] || {}
+
+    if (bot.name === activeProfileName && gatewayBusy) {
+      summary.working += 1
+    }
+
+    if (m.paused) {
+      summary.paused += 1
+    }
+
+    if (unread && unread[bot.name]) {
+      summary.unread += 1
+    }
+
+    const last = bot.last_session
+
+    if (last?.last_active && now - last.last_active < ACTIVE_WINDOW_S) {
+      summary.active += 1
+    }
+  }
+
+  summary.needYou = needsYouOf(roster, unread).length
+
+  return summary
+}
+
+/** What needs a human right now: bot-to-bot replies that landed while the
+ *  recipient's chat wasn't open (the human should relay/read them), plus
+ *  previews that look like a failed handoff. Newest first. */
+function needsYouOf(roster, unread) {
+  const out = []
+
+  for (const bot of roster || []) {
+    const last = bot.last_session
+    const from = last ? previewKind(last.preview || '').fromBot : null
+
+    if (!last || !from || (unread && !unread[bot.name])) {
+      continue
+    }
+
+    const preview = (last.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+
+    out.push({
+      bot,
+      from,
+      preview,
+      kind: /No session found matching|handoff failed|Error/i.test(preview) ? 'handoff_failed' : 'reply_to_relay',
+      ts: last.last_active || 0
+    })
+  }
+
+  return out.sort((a, b) => b.ts - a.ts)
+}
+
+// ── fleet page (Phase 3) ─────────────────────────────────────────────────────
+
+/** Reserved bot-meta key for fleet-wide policy. No profile can collide: the
+ *  profile NAME_RE requires a leading [a-z0-9], so '__fleet__' is safe. */
+const FLEET_KEY = '__fleet__'
+
+/** Unified status model across ALL surfaces (Bots pane, Tasks board, Fleet page).
+ *  Strict deterministic precedence:
+ *  1. Paused: bot paused by user (never accepts new work)
+ *  2. Needs you: current work explicitly blocked on human (approval, review, question, failure)
+ *  3. Working: active execution currently running (gateway busy or recent active execution)
+ *  4. Waiting: blocked on another peer bot's reply (open handoff)
+ *  5. Muted: working silently without alerts
+ *  6. Idle: at rest
+ */
+function unifiedBotState(bot, meta, unread = false, activeProfile = null, isBusy = false, openLoops = 0, nowSec = Date.now() / 1000) {
+  if (!bot) return { state: 'idle', label: 'Idle', verb: '', cls: 'text-(--ui-text-tertiary)' }
+  
+  // 1. Paused
+  if (meta?.paused) {
+    return { state: 'paused', label: 'Paused', verb: 'Not accepting new tasks', cls: 'bg-(--ui-stroke-secondary) text-(--ui-text-tertiary)' }
+  }
+
+  const rawPreview = bot.last_session?.preview || ''
+  const cleanPreview = rawPreview.replace(A2A_PREFIX_RE, '').trim()
+  const actionVerb = cleanPreview.slice(0, 36)
+
+  // 2. Needs you — must be an EXPLICIT human action requirement, not merely an unread info message.
+  // Triggers: explicit approval required, review needed, failure requiring intervention, or question asked to user.
+  const requiresHumanAction =
+    /approve|approval required|needs review|review changes|review needed|action required|confirm|question|failed|error|blocked/i.test(cleanPreview) ||
+    Boolean(meta?.require_approval && openLoops > 0)
+
+  if (requiresHumanAction && unread) {
+    return {
+      state: 'waiting_user',
+      label: 'Needs you',
+      verb: actionVerb ? `Waiting for you · ${actionVerb}` : 'Waiting for your review',
+      cls: 'bg-amber-400 text-black font-semibold shadow-[0_0_6px_#fbbf24]'
+    }
+  }
+
+  // 3. Working — execution currently running
+  const isProfileBusy = Boolean(bot.name === activeProfile && isBusy)
+  const lastActive = bot.last_session?.last_active || 0
+  const isExecuting = lastActive && (nowSec - lastActive < ACTIVE_WINDOW_S)
+  const isWorking = isProfileBusy || isExecuting
+
+  if (isWorking) {
+    return {
+      state: 'working',
+      label: 'Working',
+      verb: actionVerb ? `Working · ${actionVerb}` : 'Working…',
+      cls: 'hermes-bots-pulse bg-(--ui-accent,#4f9cf9) text-white'
+    }
+  }
+
+  // 4. Waiting — blocked on another bot
+  if (openLoops > 0) {
+    return {
+      state: 'waiting_reply',
+      label: 'Waiting',
+      verb: `${openLoops} waiting on peer reply`,
+      cls: 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+    }
+  }
+
+  // 5. Muted
+  if (meta?.muted) {
+    return { state: 'muted', label: 'Muted', verb: 'Working silently', cls: 'text-(--ui-text-quaternary)' }
+  }
+
+  // 6. Idle
+  return { state: 'idle', label: 'Idle', verb: 'At rest', cls: 'text-(--ui-text-tertiary)' }
+}
+
+/** Per-bot status for the fleet grid, pause/mute ladder using unifiedBotState. */
+function fleetStatusOf(bot, meta, unread = false, activeProfile = null, isBusy = false, openLoops = 0) {
+  const s = unifiedBotState(bot, meta, unread, activeProfile, isBusy, openLoops)
+  return s.state
+}
+
+/** Classify a chat preview for the timeline filter. Cron runs arrive via the
+ *  routine delegation wrapper ("Routine: …" / "[Scheduled routine] …"); a
+ *  bot-to-bot DM carries the delivery prefix; everything else is a human
+ *  exchange. Heuristic, deliberately — the preview is the only signal the
+ *  roster poll carries. Pure. */
+function fleetEventKind(preview) {
+  const text = (preview || '').trim()
+  if (/Routine:|\[Scheduled routine\]/i.test(text)) {
+    return 'cron'
+  }
+  if (previewKind(text).fromBot) {
+    return 'bot_to_bot'
+  }
+  return 'human'
+}
+
+/** Extract the best epoch timestamp (in seconds) for a session object. */
+function sessionTimestamp(session) {
+  if (!session) return 0
+  const ts =
+    session.last_activity_at ||
+    session.last_active ||
+    session.lastActive ||
+    session.started_at ||
+    session.created_at ||
+    session.ts ||
+    0
+  return ts > 1e11 ? ts / 1000 : Number(ts) || 0
+}
+
+/** One tracked session in an agent's record: what kind of exchange it was
+ *  (bot-to-bot / routine / human), who it was with, its readable title, and
+ *  a stripped preview of the last message. Drives the row-expand track
+ *  record so the pane reads as "what has this agent been doing". */
+function trackEntryOf(session) {
+  const raw = session?.preview || ''
+  const kind = fleetEventKind(raw)
+  const preview = raw.replace(A2A_PREFIX_RE, '').trim()
+
+  return {
+    id: session?.id,
+    title: generatedSessionTitle(session, raw) || 'Conversation',
+    preview,
+    kind,
+    fromBot: kind === 'bot_to_bot' ? previewKind(raw).fromBot : null,
+    ts: sessionTimestamp(session)
+  }
+}
+
+/** Extract deliverable summary and icon from a session preview or title. */
+function extractDeliverable(session) {
+  const text = `${session?.title || ''} ${session?.preview || ''}`.toLowerCase()
+  if (/pick|signal|long|short|target|entry|stop|options|strike/i.test(text)) {
+    return { kind: 'signal', icon: 'graph', label: 'Trade Signal' }
+  }
+  if (/diff|patch|modified|files|code|refactor|commit|tests/i.test(text)) {
+    return { kind: 'code', icon: 'diff', label: 'Code Changes' }
+  }
+  if (/report|findings|analysis|summary|digest|review/i.test(text)) {
+    return { kind: 'report', icon: 'file-text', label: 'Report / Doc' }
+  }
+  if (/inbox|email|spam|triage|action items/i.test(text)) {
+    return { kind: 'triage', icon: 'inbox', label: 'Triage / Action' }
+  }
+  return { kind: 'task', icon: 'check', label: 'Deliverable' }
+}
+
+/** Derive 4 Kanban workstream columns from roster, unread states, and active execution:
+ *  - inbox: fresh triggers or unstarted handoffs
+ *  - in_progress: currently executing (gateway busy or recent active window)
+ *  - needs_review: human decision gate (unseen bot replies, review items)
+ *  - completed: finished tasks with deliverables
+ */
+function deriveWorkstreamTasks(roster, unread = {}, activeProfile = null, isBusy = false, nowSec = Date.now() / 1000) {
+  const columns = {
+    inbox: [],
+    in_progress: [],
+    needs_review: [],
+    completed: []
+  }
+
+  const list = Array.isArray(roster) ? roster : []
+  for (const bot of list) {
+    const s = bot.last_session
+    if (!s) continue
+
+    const entry = trackEntryOf(s)
+    const deliv = extractDeliverable(s)
+    const isUnread = Boolean(unread[bot.name])
+    const isActiveNow = Boolean(s.last_active && (nowSec - s.last_active < ACTIVE_WINDOW_S))
+    const isProfileBusy = Boolean(bot.name === activeProfile && isBusy)
+
+    const task = {
+      id: s.id || `${bot.name}-task`,
+      botName: bot.name,
+      bot,
+      title: entry.title,
+      preview: entry.preview,
+      kind: entry.kind,
+      fromBot: entry.fromBot,
+      deliverable: deliv,
+      ts: entry.ts,
+      isUnread,
+      isActiveNow: isActiveNow || isProfileBusy
+    }
+
+    if (isProfileBusy || (isActiveNow && !isUnread)) {
+      columns.in_progress.push(task)
+    } else if (isUnread || entry.kind === 'bot_to_bot' || /needs review|pending approval|review needed|attention/i.test(entry.preview)) {
+      columns.needs_review.push(task)
+    } else if (/queued|scheduled|pending|routine/i.test(entry.preview)) {
+      columns.inbox.push(task)
+    } else {
+      columns.completed.push(task)
+    }
+  }
+
+  // Sort each column newest first
+  for (const col of Object.keys(columns)) {
+    columns[col].sort((a, b) => b.ts - a.ts)
+  }
+
+  return columns
+}
+
+/** Filter board tasks by selected bot name ('all' or specific bot handle) and text query. */
+function filterBoardTasks(tasks, botFilter = 'all', query = '') {
+  const q = (query || '').trim().toLowerCase()
+  const targetBot = (botFilter || 'all').trim().toLowerCase()
+
+  return (tasks || []).filter(task => {
+    if (targetBot !== 'all' && task.botName.toLowerCase() !== targetBot) {
+      return false
+    }
+    if (!q) return true
+    const haystack = `${task.title} ${task.preview} ${task.botName}`.toLowerCase()
+    return haystack.includes(q)
+  })
+}
+
+/** Toggle a session id in a pinned list. Returns a NEW array (immutable). */
+function togglePinnedId(ids, id) {
+  const set = new Set(ids || [])
+
+  if (set.has(id)) {
+    set.delete(id)
+  } else {
+    set.add(id)
+  }
+
+  return Array.from(set)
+}
+
+/** Order a session list so pinned sessions float to the top, each group
+ *  sorted strictly by time (newest first). Stable: equal keys keep
+ *  their relative order. */
+function pinnedFirst(sessions, pinnedIds) {
+  const list = Array.isArray(sessions) ? sessions.slice() : []
+  const pinned = new Set(pinnedIds || [])
+  const timeOf = s => sessionTimestamp(s)
+
+  return list.sort((a, b) => {
+    const pa = pinned.has(a?.id) ? 1 : 0
+    const pb = pinned.has(b?.id) ? 1 : 0
+
+    if (pa !== pb) {
+      return pb - pa
+    }
+
+    return timeOf(b) - timeOf(a)
+  })
+}
+
+/** Timeline for the Fleet page: one event per bot (its newest message),
+ *  tagged with a kind for the All / Bot-to-bot / Human / Cron filter.
+ *  Newest first, capped. Pure so tests can pin ordering, filter, cap. */
+function fleetTimeline(roster, filter = 'all', limit = 12) {
+  const events = (roster || [])
+    .filter(bot => bot?.last_session?.last_active)
+    .map(bot => {
+      const preview = (bot.last_session.preview || '').trim()
+      return {
+        bot,
+        kind: fleetEventKind(preview),
+        preview: preview.replace(A2A_PREFIX_RE, '').trim() || '…',
+        ts: bot.last_session.last_active
+      }
+    })
+    .sort((a, b) => b.ts - a.ts)
+
+  return (filter === 'all' ? events : events.filter(event => event.kind === filter)).slice(0, limit)
+}
+
+/** One-line-per-bot fleet digest from the live roster. Phase 4 ships the
+ *  full cron generator (scripts/fleet-digest) with handoff ledgers; until
+ *  then "Digest now" composes from what the poll already carries. Pure. */
+function composeFleetDigest(roster, meta, queue = {}) {
+  const rows = (roster || []).map(bot => {
+    const botMeta = meta?.[bot.name] || {}
+    const last = bot.last_session
+    const action = last
+      ? `last action: ${(last.preview || '').replace(A2A_PREFIX_RE, '').trim().slice(0, 80) || '…'} (${relativeTime(last.last_active * 1000)})`
+      : 'no activity yet'
+    const loops = openLoopsByBot([bot])[bot.name] || 0
+    const queued = queue[bot.name] || 0
+    return `${displayName(bot, botMeta)} (@${botHandle(bot.name)}) — ${fleetStatusOf(bot, botMeta)}; ${action}; ${loops} open loop${loops === 1 ? '' : 's'}; ${queued} queued`
+  })
+  return rows.length ? rows.join('\n') : 'No bots in the fleet yet.'
+}
+
+/** Cross-bot history search — the LOCAL fallback for the Fleet page search
+ *  box (the RAG path runs first when the gateway exposes rag_query).
+ *  `sessions` is the flattened session.list scan across every bot:
+ *  [{profile, id, title, preview, last_active}]. A query matches a
+ *  session's title/preview OR its bot's name/title/description; each result
+ *  carries the bot + session so the page can open the exact chat. Newest
+ *  first, capped; an empty query returns nothing (an empty search box shows
+ *  no results, not everything). Pure so tests can pin matching, ordering,
+ *  the cap, and the edge cases. */
+function fleetSearchResults(roster, sessions, query, limit = 20) {
+  const q = (query || '').trim().toLowerCase()
+  if (!q) {
+    return []
+  }
+
+  const byName = new Map((roster || []).map(bot => [bot.name, bot]))
+  const out = []
+
+  for (const session of sessions || []) {
+    const bot = byName.get(session?.profile)
+    const haystack = [session?.title, session?.preview, bot?.name, bot?.title, bot?.description]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+
+    if (!haystack.includes(q)) {
+      continue
+    }
+
+    out.push({
+      bot: bot ?? null,
+      profile: session?.profile || bot?.name || 'unknown',
+      sessionId: session?.id || null,
+      title: session?.title || '',
+      preview: (session?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…',
+      fromBot: previewKind(session?.preview || '').fromBot,
+      ts: session?.last_active || 0
+    })
+  }
+
+  return out.sort((a, b) => b.ts - a.ts).slice(0, limit)
+}
+
+/** At-a-glance "what is happening": the newest message from every bot —
+ *  bot-to-bot AND human, framed in plain language. Collapsible. */
+function FleetActivity({ roster, meta, openLoops }) {
+  const [open, setOpen] = useState(false)
+  const events = recentFleetActivity(roster, 6)
+
+  if (!events.length) {
+    return null
+  }
+
+  return jsxs('div', {
+    className: 'mx-2.5 mb-1 rounded-md border border-(--ui-stroke-secondary) bg-(--chrome-action-hover)',
+    children: [
+      jsxs('button', {
+        type: 'button',
+        className: 'flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left',
+        onClick: () => setOpen(openState => !openState),
+        'aria-expanded': open,
+        children: [
+          jsxs('span', {
+            className:
+              'flex items-center gap-1.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)',
+            children: [
+              jsx(Codicon, { name: 'history', className: 'text-[0.8rem]' }),
+              'Recent activity',
+              jsx('span', {
+                className:
+                  'rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-text-quaternary)',
+                children: String(events.length)
+              })
+            ]
+          }),
+          jsx(Codicon, {
+            name: open ? 'chevron-up' : 'chevron-down',
+            className: 'text-(--ui-text-quaternary)'
+          })
+        ]
+      }),
+      open
+        ? jsx('div', {
+            className: 'flex flex-col gap-px pb-1',
+            children: events.map(event => {
+              const botMeta = meta[event.bot.name] || {}
+              const { shape, color, image } = botAppearance(event.bot.name, botMeta)
+              const preview = event.preview.replace(A2A_PREFIX_RE, '').trim() || '…'
+
+              return jsxs(
+                'button',
+                {
+                  type: 'button',
+                  className:
+                    'flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)',
+                  onClick: () => void openBotChat(event.bot, botMeta),
+                  children: [
+                    jsx(BotFace, { shape, color, image, size: 20, name: event.bot.name, mood: 'idle' }),
+                    event.fromBot
+                      ? jsx('span', {
+                          className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                          children: `@${event.fromBot} →`
+                        })
+                      : null,
+                    jsx('span', {
+                      className: 'shrink-0 text-[0.6875rem] font-medium',
+                      children: displayName(event.bot, botMeta)
+                    }),
+                    jsx('span', {
+                      className: 'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                      children: preview
+                    }),
+                    jsx('span', {
+                      className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                      children: relativeTime(event.lastActive * 1000)
+                    }),
+                    openLoops && openLoops[event.bot.name]
+                      ? jsx('span', {
+                          className:
+                            'shrink-0 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.5625rem] font-medium text-amber-400',
+                          title: `${openLoops[event.bot.name]} open handoff${openLoops[event.bot.name] === 1 ? '' : 's'} awaiting reply`,
+                          children: `${openLoops[event.bot.name]} open`
+                        })
+                      : null
+                  ]
+                },
+                event.bot.name + event.lastActive
+              )
+            })
+          })
+        : null
+    ]
+  })
+}
+
+/** Human inbox: bot-to-bot replies that arrived unseen (relay them), and
+ *  anything that looks like a failed handoff. Loud, small, and honest —
+ *  when nothing needs you, this section does not exist. */
+function NeedsYou({ roster, unread, meta }) {
+  const items = needsYouOf(roster, unread)
+
+  if (!items.length) {
+    return null
+  }
+
+  return jsxs('div', {
+    className: 'mx-2.5 mb-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 p-2 shadow-xs',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-1.5 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wider text-amber-400',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-1.5',
+            children: [
+              jsx(Codicon, { name: 'warning', className: 'text-[0.85rem]' }),
+              jsx('span', { children: 'Needs attention' })
+            ]
+          }),
+          jsx('span', {
+            className: 'rounded-full bg-amber-400 px-1.5 py-px text-[0.625rem] font-bold text-black',
+            children: String(items.length)
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'flex flex-col gap-px pb-1',
+        children: items.map(item => {
+          const botMeta = meta[item.bot.name] || {}
+          const { shape, color, image } = botAppearance(item.bot.name, botMeta)
+
+          return jsxs(
+            'button',
+            {
+              type: 'button',
+              className:
+                'flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)',
+              onClick: () => void openBotChat(item.bot, botMeta),
+              children: [
+                jsx(BotFace, { shape, color, image, size: 20, name: item.bot.name, mood: 'idle' }),
+                jsx('span', {
+                  className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                  children: `@${item.from} →`
+                }),
+                jsx('span', {
+                  className: 'shrink-0 text-[0.6875rem] font-medium',
+                  children: displayName(item.bot, botMeta)
+                }),
+                jsx('span', {
+                  className: 'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                  children: item.preview
+                }),
+                item.kind === 'handoff_failed'
+                  ? jsx('span', {
+                      className:
+                        'flex shrink-0 items-center gap-0.5 rounded-full bg-(--chrome-action-hover) px-1 py-px text-[0.5625rem] font-medium text-amber-400',
+                      children: ['⚠', 'failed']
+                    })
+                  : jsx('span', {
+                      className:
+                        'flex shrink-0 items-center gap-0.5 rounded-full bg-(--chrome-action-hover) px-1 py-px text-[0.5625rem] font-medium text-(--ui-accent,#4f9cf9)',
+                      children: ['🤖', 'reply']
+                    }),
+                jsx('span', {
+                  className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                  children: relativeTime(item.ts * 1000)
+                })
+              ]
+            },
+            item.from + '>' + item.bot.name + item.ts
+          )
+        })
+      })
+    ]
+  })
+}
+
+function TaskStreamView({ roster, unread, activeProfile, isBusy, query, onOpenChat, onReview, allMeta = {} }) {
+  const columns = deriveWorkstreamTasks(roster, unread, activeProfile, isBusy, Date.now() / 1000)
+  const allTasks = [...columns.in_progress, ...columns.needs_review, ...columns.inbox, ...columns.completed]
+  const filtered = filterBoardTasks(allTasks, 'all', query)
+
+  if (!filtered.length) {
+    return jsx('div', {
+      className: 'flex flex-1 items-center justify-center p-6 text-center text-xs text-(--ui-text-quaternary) font-mono',
+      children: query ? `No tasks match “${query}”` : 'No active tasks found'
+    })
+  }
+
+  return jsx(ScrollArea, {
+    className: 'min-h-0 flex-1 px-2 pb-2',
+    children: jsx('div', {
+      className: 'flex flex-col gap-2',
+      children: filtered.map(task =>
+        jsx(
+          TaskCard,
+          {
+            task,
+            allMeta,
+            onOpenChat,
+            onReview
+          },
+          task.id
+        )
+      )
+    })
+  })
+}
+
 function BotsPane() {
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayUp = useValue(host.state.gateway) === 'open'
+  const gatewayState = useValue(host.state.gateway)
+  const activeProfile = useValue(host.state.profile)
   const [createOpen, setCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [query, setQuery] = useState('')
+  const [viewMode, setViewMode] = useState('roster') // 'roster' | 'board'
+  const [selectedTask, setSelectedTask] = useState(null)
+  const unread = useValue($botUnread)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -4292,12 +5467,31 @@ function BotsPane() {
   })
   const filteredRoster = filterBots(roster, allMeta, query)
 
+  // Pinned group headers only appear when BOTH groups have rows (a single
+  // group needs no label — the pane already says "Bots").
+  const pinnedRows = filteredRoster.filter(isPinned)
+  const restRows = filteredRoster.filter(bot => !isPinned(bot))
+  const showGroups = pinnedRows.length > 0 && restRows.length > 0
+  // Unanswered handoffs per sender — feeds the amber "N open" row badges.
+  const openLoops = openLoopsByBot(filteredRoster)
+  // At-a-glance "what is happening" counts for the summary strip.
+  const summary = fleetSummary(filteredRoster, allMeta, unread, activeProfile, gatewayState === 'busy')
+  // Newest reply waiting for a human — the "need you" chip jumps to it.
+  const firstNeed = needsYouOf(filteredRoster, unread)[0]
+
   if (live) {
     $lastRoster.set(roster)
     mergeServerMeta(live)
     pullServerAvatars(live)
     trackInboundActivity(live)
+    // Prewarm strategy is upstream #44: per-hover via BotRow.onPointerEnter
+    // — NOT warm-all here (warmProfile re-touches the backend-pool idle
+    // clock, so a per-poll loop would pin every backend resident forever).
   }
+
+  const isBusy = gatewayState === 'busy'
+  const taskColumns = deriveWorkstreamTasks(roster, unread, activeProfile, isBusy, Date.now())
+  const totalTasksCount = taskColumns.in_progress.length + taskColumns.needs_review.length + taskColumns.inbox.length + taskColumns.completed.length
 
   const staleNotice = error && !live && roster.length
     ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
@@ -4309,19 +5503,67 @@ function BotsPane() {
       jsxs('div', {
         className: 'flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5',
         children: [
-          jsx('span', {
-            className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-            children: 'Bots'
+          jsxs('div', {
+            className: 'flex items-center gap-1.5',
+            children: [
+              // Segmented Switcher: Roster vs Board
+              jsxs('div', {
+                className: 'flex items-center gap-0.5 rounded-md border border-(--ui-stroke-secondary) p-0.5 bg-(--chrome-action-hover)/40',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: cn(
+                      'rounded px-2 py-0.5 text-[0.6875rem] font-semibold transition-colors',
+                      viewMode === 'roster' ? 'bg-card text-foreground shadow-xs' : 'text-(--ui-text-tertiary) hover:text-foreground'
+                    ),
+                    onClick: () => setViewMode('roster'),
+                    children: `Bots ${roster.length}`
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: cn(
+                      'rounded px-2 py-0.5 text-[0.6875rem] font-semibold transition-colors',
+                      viewMode === 'board' ? 'bg-card text-foreground shadow-xs' : 'text-(--ui-text-tertiary) hover:text-foreground'
+                    ),
+                    onClick: () => setViewMode('board'),
+                    children: `Tasks ${totalTasksCount}`
+                  })
+                ]
+              }),
+              jsx('span', {
+                className: cn('size-1.5 rounded-full ml-1', gatewayUp ? 'bg-emerald-400' : 'bg-amber-400'),
+                title: gatewayUp ? 'Gateway connected' : 'Gateway disconnected — retrying…'
+              })
+            ]
           }),
-          jsx(Tip, {
-            label: 'New Agent',
-            children: jsx('button', {
-              type: 'button',
-              className:
-                'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
-              onClick: () => setCreateOpen(true),
-              children: jsx(Codicon, { name: 'add' })
-            })
+          jsxs('div', {
+            className: 'flex items-center gap-1',
+            children: [
+              jsx(Tip, {
+                label: 'Open Full Squad Board',
+                children: jsx('button', {
+                  type: 'button',
+                  className:
+                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                  onClick: () => {
+                    if (typeof host.navigate === 'function') {
+                      host.navigate('/board')
+                    }
+                  },
+                  children: jsx(Codicon, { name: 'screen-full', className: 'text-[0.8rem]' })
+                })
+              }),
+              jsx(Tip, {
+                label: 'New Agent',
+                children: jsx('button', {
+                  type: 'button',
+                  className:
+                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                  onClick: () => setCreateOpen(true),
+                  children: jsx(Codicon, { name: 'add' })
+                })
+              })
+            ]
           })
         ]
       }),
@@ -4329,15 +5571,73 @@ function BotsPane() {
         ? jsx('div', {
             className: 'px-2.5 pb-1.5',
             children: jsx(SearchField, {
-              'aria-label': 'Search bots',
+              'aria-label': viewMode === 'board' ? 'Search tasks' : 'Search bots',
               containerClassName: 'w-full',
               inputClassName: 'w-full',
-              placeholder: 'Search bots…',
+              placeholder: viewMode === 'board' ? 'Search tasks…' : 'Search bots…',
               value: query,
               onChange: setQuery
             })
           })
         : null,
+      summary.needYou || summary.working || summary.unread || summary.active || summary.paused
+        ? jsxs('div', {
+            className:
+              'mx-2.5 mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border border-(--ui-stroke-secondary) bg-(--chrome-action-hover) px-2 py-1',
+            children: [
+              summary.needYou && firstNeed
+                ? jsx('button', {
+                    type: 'button',
+                    className:
+                      'flex cursor-pointer items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-semibold text-amber-400 transition-colors hover:opacity-80',
+                    title: 'Jump to the newest bot-to-bot reply waiting for you',
+                    onClick: () => void openBotChat(firstNeed.bot, allMeta[firstNeed.bot.name] || {}),
+                    children: [jsx('span', { className: 'size-1.5 rounded-full bg-amber-400' }), `${summary.needYou} need you`]
+                  })
+                : null,
+              summary.working
+                ? jsx('span', {
+                    className:
+                      'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-semibold text-(--ui-accent,#4f9cf9)',
+                    title: 'Running a turn right now',
+                    children: [
+                      jsx('span', { className: 'hermes-bots-pulse size-1.5 rounded-full bg-(--ui-accent,#4f9cf9)' }),
+                      `${summary.working} working`
+                    ]
+                  })
+                : null,
+              summary.unread
+                ? jsx('span', {
+                    className:
+                      'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-text-secondary)',
+                    title: 'Bots with new messages you have not opened',
+                    children: [jsx('span', { className: 'size-1.5 rounded-full bg-(--ui-accent,#4f9cf9)' }), `${summary.unread} new`]
+                  })
+                : null,
+              summary.active
+                ? jsx('span', {
+                    className:
+                      'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-text-tertiary)',
+                    title: 'Wrote something in the last 90 seconds',
+                    children: [
+                      jsx('span', { className: 'size-1.5 rounded-full bg-(--ui-text-quaternary)' }),
+                      `${summary.active} active`
+                    ]
+                  })
+                : null,
+              summary.paused
+                ? jsx('span', {
+                    className:
+                      'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-text-tertiary)',
+                    title: 'Paused — handoffs blocked',
+                    children: ['⏸', `${summary.paused} paused`]
+                  })
+                : null
+            ]
+          })
+        : null,
+      jsx(NeedsYou, { roster: filteredRoster, unread, meta: allMeta }),
+      jsx(FleetActivity, { roster: filteredRoster, meta: allMeta, openLoops }),
       staleNotice
         ? jsx('div', {
             className: 'mx-2.5 mb-1 rounded-md bg-(--chrome-action-hover) px-2 py-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
@@ -4373,7 +5673,26 @@ function BotsPane() {
                 title: 'No agents yet',
                 description: 'Create your first teammate.'
               })
-            : filteredRoster.length === 0
+            : viewMode === 'board'
+              ? jsx(TaskStreamView, {
+                  roster,
+                  unread,
+                  activeProfile,
+                  isBusy: gatewayState === 'busy',
+                  query,
+                  allMeta,
+                  onOpenChat: async task => {
+                    if (task.id && typeof host.openSession === 'function') {
+                      try {
+                        await host.openSession(task.id, { profile: task.botName })
+                        return
+                      } catch {}
+                    }
+                    await openBotChat(task.bot || { name: task.botName }, allMeta[task.botName])
+                  },
+                  onReview: t => setSelectedTask(t)
+                })
+              : filteredRoster.length === 0
               ? jsx('div', {
                   'aria-live': 'polite',
                   className:
@@ -4385,19 +5704,79 @@ function BotsPane() {
                   className: 'hermes-bots-roster min-h-0 flex-1',
                   children: jsx('div', {
                     className: 'grid w-full min-w-0 gap-0.5 px-1.5 pb-2',
-                    children: filteredRoster.map(bot =>
-                      jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing }, bot.name)
-                    )
+                    children: showGroups
+                      ? [
+                          jsx(RosterGroupLabel, { key: 'pinned', children: 'Pinned' }),
+                          ...pinnedRows.map(bot =>
+                            jsx(
+                              BotRow,
+                              { bot, onDelete: setDeleting, onEdit: setEditing, openLoops: openLoops[bot.name] || 0 },
+                              bot.name
+                            )
+                          ),
+                          jsx(RosterGroupLabel, { key: 'agents', children: 'Agents' }),
+                          ...restRows.map(bot =>
+                            jsx(
+                              BotRow,
+                              { bot, onDelete: setDeleting, onEdit: setEditing, openLoops: openLoops[bot.name] || 0 },
+                              bot.name
+                            )
+                          )
+                        ]
+                      : filteredRoster.map(bot =>
+                          jsx(
+                            BotRow,
+                            { bot, onDelete: setDeleting, onEdit: setEditing, openLoops: openLoops[bot.name] || 0 },
+                            bot.name
+                          )
+                        )
                   })
                 }),
+      jsx(TaskReviewDrawer, {
+        task: selectedTask,
+        open: Boolean(selectedTask),
+        allMeta,
+        onClose: () => setSelectedTask(null),
+        onOpenChat: async task => {
+          if (task.id && typeof host.openSession === 'function') {
+            try {
+              await host.openSession(task.id, { profile: task.botName })
+              return
+            } catch {}
+          }
+          await openBotChat(task.bot || { name: task.botName }, allMeta[task.botName])
+        }
+      }),
       jsx('div', {
-        className: 'border-t border-(--ui-stroke-secondary) p-2',
-        children: jsxs(Button, {
-          className: 'w-full justify-center gap-1.5',
-          variant: 'secondary',
-          onClick: () => setCreateOpen(true),
-          children: [jsx(Codicon, { name: 'add' }), 'New Agent']
-        })
+        className: 'flex flex-col gap-1 border-t border-(--ui-stroke-secondary) p-2',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-1.5 px-0.5 text-[0.625rem] text-(--ui-text-quaternary)',
+            title: gatewayUp
+              ? `${roster.length} agent${roster.length === 1 ? '' : 's'} · gateway connected`
+              : 'Gateway disconnected — reconnecting…',
+            children: [
+              jsx('span', {
+                className: cn(
+                  'size-1.5 shrink-0 rounded-full',
+                  gatewayUp ? 'bg-(--ui-accent,#4f9cf9)' : 'hermes-bots-pulse bg-(--ui-text-tertiary)'
+                )
+              }),
+              jsx('span', {
+                className: 'truncate',
+                children: gatewayUp
+                  ? `Gateway connected · ${roster.length} agent${roster.length === 1 ? '' : 's'}`
+                  : 'Gateway reconnecting…'
+              })
+            ]
+          }),
+          jsxs(Button, {
+            className: 'w-full justify-center gap-1.5',
+            variant: 'secondary',
+            onClick: () => setCreateOpen(true),
+            children: [jsx(Codicon, { name: 'add' }), 'New Agent']
+          })
+        ]
       }),
       jsx(CreateAgentDialog, {
         open: createOpen,
@@ -4449,6 +5828,1171 @@ function BotsPane() {
   })
 }
 
+// ── fleet page (Phase 3) ─────────────────────────────────────────────────────
+
+const TIMELINE_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'bot_to_bot', label: 'Bot-to-bot' },
+  { id: 'human', label: 'Human' },
+  { id: 'cron', label: 'Cron' }
+]
+
+/** Interactive squad pipeline card: a tiny pure-SVG flow diagram of live
+ *  bot-to-bot traffic — nodes are the roster bots on an arc (left → top →
+ *  right), links are directed pairs whose stroke width scales with flow
+ *  volume and whose color flips amber while a reply is still owed — plus
+ *  one-line flow stats. Pure render off buildHandoffMatrix(): no canvas, no
+ *  animation loops, just a flat map of a few dozen SVG elements with
+ *  CSS-only hover transitions, so it stays cheap even in the tiled pane.
+ *  Hover a link for its pair tooltip; click a node to open that bot. */
+function FleetMatrix({ matrix, roster, allMeta, onOpenBot }) {
+  const { totalFlows, pendingReplies, activePairs, connectionGraph } = matrix
+  const nodes = connectionGraph.nodes || []
+  const links = connectionGraph.links || []
+  const byName = new Map((roster || []).map(bot => [bot.name, bot]))
+
+  // Deterministic arc layout: positions derive from node index only, so a
+  // roster change re-derives angles with zero measurement or reflow.
+  const CX = 150
+  const CY = 72
+  const RX = 114
+  const RY = 40
+  const positionOf = index => {
+    const t = nodes.length > 1 ? index / (nodes.length - 1) : 0.5
+    const theta = Math.PI * (1 - t)
+    return { x: CX + RX * Math.cos(theta), y: CY - RY * Math.sin(theta) }
+  }
+  const indexOf = new Map(nodes.map((node, index) => [node.id, index]))
+  const flowColor = link => (link.pending > 0 ? '#fbbf24' : '#34d399') // amber owes a reply, emerald settled
+
+  return jsxs('div', {
+    className: 'mt-1 overflow-hidden rounded-lg border border-(--ui-stroke-secondary)',
+    children: [
+      // Header + live flow stats.
+      jsxs('div', {
+        className: 'flex items-center gap-1.5 px-2.5 pb-1 pt-2',
+        children: [
+          jsx(Codicon, { name: 'graph-line', className: 'text-[0.8rem] text-(--ui-text-tertiary)' }),
+          jsx('span', {
+            className: 'text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+            children: 'Pipeline'
+          }),
+          jsxs('span', {
+            className: 'ml-auto flex items-center gap-1 text-[0.5625rem] text-(--ui-text-tertiary)',
+            children: [
+              jsxs('span', { className: 'rounded-full bg-(--chrome-action-hover) px-1.5 py-px', children: [`${totalFlows} flows`] }),
+              jsxs('span', { className: 'rounded-full bg-amber-400/10 px-1.5 py-px text-amber-400', children: [`${pendingReplies} pending`] }),
+              jsxs('span', { className: 'rounded-full bg-(--chrome-action-hover) px-1.5 py-px', children: [`${activePairs} pairs`] })
+            ]
+          })
+        ]
+      }),
+      totalFlows === 0 || nodes.length === 0
+        ? jsx('div', {
+            className: 'px-2.5 pb-2.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: 'No bot-to-bot traffic yet.'
+          })
+        : jsxs('svg', {
+            viewBox: '0 0 300 136',
+            className: 'block w-full',
+            role: 'img',
+            'aria-label': `Squad pipeline: ${totalFlows} flows, ${pendingReplies} awaiting reply, ${activePairs} active pairs`,
+            children: [
+              jsx('defs', {
+                children: jsx('marker', {
+                  id: 'fleetMatrixArrow',
+                  viewBox: '0 0 8 8',
+                  refX: 7,
+                  refY: 4,
+                  markerWidth: 6,
+                  markerHeight: 6,
+                  orient: 'auto-start-reverse',
+                  children: jsx('path', { d: 'M0,0 L8,4 L0,8 z', fill: 'context-stroke' })
+                })
+              }),
+              // Links first, so node discs sit on top of them.
+              links.map(link => {
+                const a = positionOf(indexOf.get(link.from))
+                const b = positionOf(indexOf.get(link.to))
+                if (!a || !b) return null
+                const selfLoop = link.from === link.to
+                const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+                const d = selfLoop
+                  ? `M ${a.x},${a.y - 13} C ${a.x + 24},${a.y - 34} ${a.x + 24},${a.y + 2} ${a.x},${a.y - 13}`
+                  : `M ${a.x},${a.y} Q ${mid.x},${mid.y} ${b.x},${b.y}`
+                return jsx('path', {
+                  key: `${link.from}->${link.to}`,
+                  d,
+                  fill: 'none',
+                  stroke: flowColor(link),
+                  strokeWidth: 1 + Math.min(link.flows, 6) * 0.9,
+                  strokeLinecap: 'round',
+                  opacity: 0.75,
+                  markerEnd: selfLoop ? undefined : 'url(#fleetMatrixArrow)',
+                  className: 'cursor-pointer transition-opacity duration-150 hover:opacity-100',
+                  title: `${link.from} ➔ ${link.to}: ${link.flows} flow${link.flows === 1 ? '' : 's'}, ${link.pending} awaiting reply`
+                })
+              }),
+              // Bot discs: appearance color, sent→received tag, name label,
+              // click opens the canonical chat.
+              nodes.map((node, index) => {
+                const pos = positionOf(index)
+                const bot = byName.get(node.id)
+                const meta = bot ? allMeta?.[bot.name] || {} : {}
+                const appearance = botAppearance(node.id, meta)
+                return jsxs(
+                  'g',
+                  {
+                    key: node.id,
+                    transform: `translate(${pos.x}, ${pos.y})`,
+                    className: 'cursor-pointer transition-opacity duration-150 hover:opacity-100',
+                    onClick: bot ? () => onOpenBot?.(bot, meta) : undefined,
+                    role: bot ? 'button' : undefined,
+                    'aria-label': bot ? `Open ${bot.name} chat` : undefined,
+                    children: [
+                      jsx('circle', {
+                        r: 11,
+                        fill: appearance.color || 'var(--ui-text-quaternary)',
+                        stroke: 'rgba(0,0,0,0.25)',
+                        strokeWidth: 1
+                      }),
+                      node.sent > 0 || node.received > 0
+                        ? jsx('text', {
+                            y: -17,
+                            textAnchor: 'middle',
+                            fontSize: 7.5,
+                            fontWeight: 600,
+                            fill: 'var(--ui-text-quaternary)',
+                            children: `${node.sent}→${node.received}`
+                          })
+                        : null,
+                      jsx('text', {
+                        y: 25,
+                        textAnchor: 'middle',
+                        fontSize: 9,
+                        fill: 'var(--ui-text-tertiary)',
+                        children: String(botHandle(node.id)).slice(0, 9)
+                      })
+                    ]
+                  },
+                  node.id
+                )
+              })
+            ]
+          })
+    ]
+  })
+}
+
+/** Full-width fleet command center: a grid of every bot (status, last
+ *  action, open loops, queue depth), global controls (pause all, quiet
+ *  hours, digest now), and a kind-filterable timeline. Phase 3.2 adds the
+ *  cross-bot search box. */
+function FleetPage() {
+  const { data, error, isLoading, refetch } = useRoster()
+  const gatewayUp = useValue(host.state.gateway) === 'open'
+  const gatewayBusy = useValue(host.state.gateway) === 'busy'
+  const activeProfile = useValue(host.state.profile)
+  const allMeta = $botMeta.get()
+  const [timelineFilter, setTimelineFilter] = useState('all')
+  // Cross-bot search (Phase 3.2): query state plus the last resolved result
+  // set. null = no search yet; the content area swaps to results while a
+  // query is active. searchSeq drops stale async responses (a slow RAG call
+  // must not overwrite a newer fallback scan).
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState(null)
+  const [searching, setSearching] = useState(false)
+  const searchSeq = useRef(0)
+
+  // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
+  // retry immediately instead of waiting out the poll interval.
+  useEffect(() => {
+    if (gatewayUp) {
+      void refetch()
+    }
+  }, [gatewayUp, refetch])
+
+  const roster = Array.isArray(data?.profiles) ? data.profiles : []
+  const fleetMeta = allMeta[FLEET_KEY] || {}
+  const openLoops = openLoopsByBot(roster)
+  // fleet-dispatch's approval queue lives on the bot host's disk; the
+  // plugin has no FS access, so the grid reports the in-app count (0 until
+  // Phase 4 wires the status RPC). Kept as a real field so the column and
+  // the digest line stay honest when a source arrives.
+  const queueDepth = {}
+  const allPaused = roster.length > 0 && roster.every(bot => allMeta[bot.name]?.paused)
+  const events = fleetTimeline(roster, timelineFilter)
+  // Live squad matrix: handoffs derived from the same roster poll, so the
+  // pipeline card below costs zero extra RPCs and re-renders on every poll.
+  const handoffs = recentHandoffs(roster, 100)
+  const matrix = buildHandoffMatrix(handoffs, roster)
+
+  const togglePauseAll = () => {
+    for (const bot of roster) {
+      saveBotMeta(bot.name, { paused: !allPaused })
+    }
+    host.notify({
+      kind: 'info',
+      message: allPaused ? 'Fleet resumed — all bots can hand off tasks again' : 'Fleet paused — all handoffs blocked until resumed'
+    })
+  }
+
+  const toggleQuietHours = () => {
+    const next = !fleetMeta.quietHours
+    saveBotMeta(FLEET_KEY, { quietHours: next })
+    host.notify({
+      kind: 'info',
+      message: next ? 'Quiet hours on — fleet-dispatch refuses sends outside the allowed window' : 'Quiet hours off'
+    })
+  }
+
+  const digestNow = () => {
+    host.notify({
+      kind: 'info',
+      title: `Fleet digest · ${roster.length} bot${roster.length === 1 ? '' : 's'}`,
+      message: composeFleetDigest(roster, allMeta, queueDepth)
+    })
+  }
+
+  const statusOf = bot => {
+    const meta = allMeta[bot.name] || {}
+    const stateObj = unifiedBotState(
+      bot,
+      meta,
+      Boolean($botUnread.get()[bot.name]),
+      activeProfile,
+      gatewayBusy,
+      openLoops[bot.name] || 0
+    )
+    return stateObj
+  }
+
+  /** Search ALL bots' history. RAG universal search first (index_name
+   *  omitted → excerpts across every profile); when the gateway doesn't
+   *  expose rag_query (or it errors/returns nothing), fall back to a local
+   *  session.list scan per bot filtered by the pure fleetSearchResults. */
+  const runSearch = async raw => {
+    const q = (raw || '').trim()
+    const seq = ++searchSeq.current
+
+    if (!q) {
+      setResults(null)
+      setSearching(false)
+      return
+    }
+
+    setSearching(true)
+    let out = null
+
+    try {
+      const rag = await host.request('rag_query', { query: q, limit: 20 })
+
+      if (Array.isArray(rag?.excerpts) && rag.excerpts.length) {
+        out = rag.excerpts.map((excerpt, index) => ({
+          bot: null,
+          profile: excerpt.profile || excerpt.source || '',
+          sessionId: excerpt.session_id || null,
+          title: excerpt.title || '',
+          preview: String(excerpt.text || excerpt.excerpt || '').slice(0, 160),
+          fromBot: null,
+          ts: excerpt.timestamp || 0,
+          key: `${excerpt.session_id || 'rag'}-${index}`
+        }))
+      }
+    } catch {
+      /* rag_query unavailable — local scan below */
+    }
+
+    if (out === null) {
+      // Fallback: flatten a session.list scan across every bot, then run
+      // the pure filter. A bot that fails to answer is skipped, not fatal.
+      const flat = []
+      await Promise.all(
+        (roster || []).map(async bot => {
+          try {
+            const res = await host.request('session.list', { profile: bot.name, limit: 20 })
+            for (const session of res?.sessions ?? []) {
+              flat.push({ profile: bot.name, ...session })
+            }
+          } catch {
+            /* bot unreachable — skip */
+          }
+        })
+      )
+      out = fleetSearchResults(roster, flat, q)
+    }
+
+    if (seq === searchSeq.current) {
+      setResults(out)
+      setSearching(false)
+    }
+  }
+
+  /** Open a search result's chat: canonical opener when the roster row is
+   *  known (fallback path), else a direct session open (RAG path). */
+  const openResult = result => {
+    if (result?.bot) {
+      void openBotChat(result.bot, allMeta[result.bot.name] || {})
+      return
+    }
+    if (result?.sessionId && typeof host.openSession === 'function') {
+      try {
+        host.openSession(result.sessionId, { profile: result.profile })
+      } catch {
+        /* navigation failure is not fatal */
+      }
+    }
+  }
+
+  const clearSearch = () => {
+    setQuery('')
+    void runSearch('')
+  }
+
+  return jsxs('div', {
+    className: 'flex h-full flex-col',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5',
+        children: [
+          jsxs('div', {
+            className: 'flex items-baseline gap-1.5',
+            children: [
+              jsx('span', {
+                className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+                children: 'Fleet'
+              }),
+              jsx('span', {
+                className: 'rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-text-tertiary)',
+                children: String(roster.length)
+              })
+            ]
+          }),
+          jsx(Tip, {
+            label: 'Fleet command center',
+            children: jsx(Codicon, { name: 'server', className: 'text-[0.95rem] text-(--ui-text-tertiary)' })
+          })
+        ]
+      }),
+      // Global controls: pause/resume the whole fleet, notification schedule
+      // toggle (rides bot-meta like every other fleet flag, so it follows
+      // the profile across machines), and an on-demand activity summary.
+      jsxs('div', {
+        className: 'mx-2.5 mb-1.5 grid grid-cols-3 gap-1.5',
+        children: [
+          jsx(Tip, {
+            label: allPaused ? 'Resumes work for all bots' : 'Pauses work for all bots (stops accepting tasks)',
+            children: jsx(Button, {
+              variant: 'secondary',
+              size: 'sm',
+              className: 'w-full justify-center gap-1 text-[0.6875rem]',
+              onClick: togglePauseAll,
+              children: [
+                jsx(Codicon, { name: allPaused ? 'play' : 'pause', className: 'text-[0.8rem]' }),
+                allPaused ? 'Resume all bots' : 'Pause all bots'
+              ]
+            })
+          }),
+          jsx(Tip, {
+            label: fleetMeta.quietHours ? 'Bot working hours active (handoffs outside window are queued/paused)' : 'Bot working hours inactive (bots operate 24/7)',
+            children: jsxs('button', {
+              type: 'button',
+              role: 'switch',
+              'aria-checked': Boolean(fleetMeta.quietHours),
+              onClick: toggleQuietHours,
+              className: cn(
+                'flex w-full items-center justify-center gap-1.5 rounded-md border px-1.5 py-1 text-[0.6875rem] transition-colors',
+                fleetMeta.quietHours
+                  ? 'border-amber-400/40 bg-amber-400/10 text-amber-400 font-medium'
+                  : 'border-(--ui-stroke-secondary) bg-(--chrome-action-hover) text-(--ui-text-tertiary) hover:text-foreground'
+              ),
+              children: [
+                jsx(Codicon, { name: 'moon', className: 'text-[0.8rem]' }),
+                fleetMeta.quietHours ? 'Working hours on' : 'Bot working hours'
+              ]
+            })
+          }),
+          jsx(Tip, {
+            label: 'Creates a clean markdown activity summary of all bot tasks',
+            children: jsx(Button, {
+              variant: 'secondary',
+              size: 'sm',
+              className: 'w-full justify-center gap-1 text-[0.6875rem]',
+              onClick: digestNow,
+              children: [jsx(Codicon, { name: 'bell', className: 'text-[0.8rem]' }), 'Activity summary']
+            })
+          })
+        ]
+      }),
+      // Cross-bot search: queries ALL bots' history via rag_query when the
+      // gateway exposes it, else a local session.list scan.
+      jsxs('div', {
+        className: 'relative mx-2.5 mb-1.5 flex items-center',
+        children: [
+          jsx(Codicon, {
+            name: 'search',
+            className: 'pointer-events-none absolute left-2 text-[0.9rem] text-(--ui-text-quaternary)'
+          }),
+          jsx(Input, {
+            className:
+              'h-7 w-full rounded-md bg-(--chrome-action-hover) pl-7 pr-7 text-xs text-foreground placeholder:text-(--ui-text-quaternary)',
+            placeholder: 'Search all bot history…',
+            value: query,
+            'aria-label': 'Search all bot history',
+            onChange: event => {
+              setQuery(event.target.value)
+              void runSearch(event.target.value)
+            },
+            onKeyDown: event => {
+              if (event.key === 'Escape') {
+                clearSearch()
+                event.currentTarget.blur()
+              }
+            }
+          }),
+          query
+            ? jsx('span', {
+                role: 'button',
+                tabIndex: 0,
+                title: 'Clear search',
+                'aria-label': 'Clear search',
+                className:
+                  'absolute right-1.5 flex size-5 cursor-pointer items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+                onClick: clearSearch,
+                onKeyDown: event => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    clearSearch()
+                  }
+                },
+                children: jsx(Codicon, { name: 'close', className: 'text-[0.85rem]' })
+              })
+            : null
+        ]
+      }),
+      // Timeline filter: All / Bot-to-bot / Human / Cron.
+      jsxs('div', {
+        className: 'mx-2.5 mb-1.5 flex items-center gap-px overflow-hidden rounded-md border border-(--ui-stroke-secondary) bg-(--chrome-action-hover)',
+        children: TIMELINE_FILTERS.map(filter => {
+          const active = timelineFilter === filter.id
+          return jsx('button', {
+            type: 'button',
+            key: filter.id,
+            'aria-pressed': active,
+            onClick: () => setTimelineFilter(filter.id),
+            className: cn(
+              'flex-1 px-1.5 py-1 text-[0.625rem] font-medium transition-colors',
+              active ? 'bg-(--ui-accent,#4f9cf9) text-white' : 'text-(--ui-text-tertiary) hover:text-foreground'
+            ),
+            children: filter.label
+          })
+        })
+      }),
+      error && !roster.length
+        ? jsxs('div', {
+            className: 'grid gap-2 px-3 py-4 text-xs text-(--ui-text-tertiary)',
+            children: [
+              jsx('div', {
+                children: gatewayUp
+                  ? `Roster unavailable: ${error instanceof Error ? error.message : 'gateway error'}.`
+                  : 'Waiting for the gateway connection…'
+              }),
+              jsx(Button, { variant: 'secondary', size: 'sm', className: 'justify-self-start', onClick: () => void refetch(), children: 'Retry now' })
+            ]
+          })
+        : isLoading && !roster.length
+          ? jsx('div', {
+              className: 'flex flex-1 items-center justify-center',
+              children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+            })
+          : roster.length === 0
+            ? jsx(EmptyState, { icon: 'hubot', title: 'No agents yet', description: 'Create your first teammate to build the fleet.' })
+            : query.trim()
+              ? jsx(ScrollArea, {
+                  className: 'min-h-0 flex-1',
+                  children: searching
+                    ? jsx('div', {
+                        className: 'flex h-full items-center justify-center py-8 text-xs text-(--ui-text-tertiary)',
+                        children: 'Searching all bots…'
+                      })
+                    : !results?.length
+                      ? jsxs('div', {
+                          className: 'grid gap-2 px-3 py-6 text-center text-xs text-(--ui-text-tertiary)',
+                          children: [
+                            jsx(Codicon, { name: 'search', className: 'mx-auto text-[1.4rem] text-(--ui-text-quaternary)' }),
+                            jsx('div', { children: `No history matches “${query.trim()}”` }),
+                            jsx(Button, { variant: 'secondary', size: 'sm', className: 'justify-self-center', onClick: clearSearch, children: 'Clear search' })
+                          ]
+                        })
+                      : jsx('div', {
+                          className: 'flex flex-col gap-px p-2.5',
+                          children: results.map((result, index) => {
+                            const botMeta = result.bot ? allMeta[result.bot.name] || {} : null
+                            const { shape, color, image } = botMeta
+                              ? botAppearance(result.bot.name, botMeta)
+                              : { shape: 'circle', color: 'var(--ui-text-quaternary)', image: null }
+
+                            return jsxs(
+                              'button',
+                              {
+                                type: 'button',
+                                key: result.key || result.sessionId || `${result.profile}:${index}`,
+                                className:
+                                  'flex w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)',
+                                onClick: () => openResult(result),
+                                children: [
+                                  result.bot
+                                    ? jsx(BotFace, { shape, color, image, size: 18, name: result.bot.name, mood: 'idle' })
+                                    : jsx('span', { className: 'w-[18px] shrink-0 text-center text-[0.7rem]', children: '🤖' }),
+                                  jsx('span', {
+                                    className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                                    children: `@${result.profile}`
+                                  }),
+                                  result.title
+                                    ? jsx('span', {
+                                        className: 'max-w-[30%] shrink-0 truncate text-[0.6875rem] font-medium',
+                                        children: result.title
+                                      })
+                                    : null,
+                                  jsx('span', {
+                                    className: 'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                                    children: result.preview
+                                  }),
+                                  result.ts
+                                    ? jsx('span', {
+                                        className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                                        children: relativeTime(result.ts * 1000)
+                                      })
+                                    : null
+                                ]
+                              },
+                              result.key || result.sessionId || `${result.profile}:${index}`
+                            )
+                          })
+                        })
+                })
+              : jsx(ScrollArea, {
+                className: 'min-h-0 flex-1',
+                children: jsx('div', {
+                  className: 'grid gap-2 p-2.5',
+                  children: [
+                    // Fleet grid: one card per bot — status, last action,
+                    // open loops, queue depth.
+                    jsx('div', {
+                      className: 'grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3',
+                      children: roster.map(bot => {
+                        const meta = allMeta[bot.name] || {}
+                        const { shape, color, image } = botAppearance(bot.name, meta)
+                        const st = statusOf(bot)
+                        const last = bot.last_session
+                        const loops = openLoops[bot.name] || 0
+                        const queued = queueDepth[bot.name] || 0
+
+                        return jsxs(
+                          'div',
+                          {
+                            key: bot.name,
+                            className: cn(
+                              'rounded-lg border border-(--ui-stroke-secondary) p-2.5 transition-colors hover:border-(--ui-stroke-primary, var(--ui-stroke-secondary))',
+                              st.state === 'paused' && 'opacity-70'
+                            ),
+                            children: [
+                              jsxs('div', {
+                                className: 'flex items-center gap-1.5',
+                                children: [
+                                  jsx(BotFace, { shape, color, image, size: 22, name: bot.name, mood: st.state === 'working' ? 'work' : 'idle' }),
+                                  jsx('span', {
+                                    className: 'min-w-0 flex-1 truncate text-xs font-semibold',
+                                    children: displayName(bot, meta)
+                                  }),
+                                  jsxs('span', {
+                                    className: cn(
+                                      'flex shrink-0 items-center gap-1 rounded-full bg-(--chrome-action-hover) px-2 py-0.5 text-[0.625rem] font-medium capitalize',
+                                      st.cls
+                                    ),
+                                    children: st.label
+                                  })
+                                ]
+                              }),
+                              jsx('p', {
+                                className: 'mt-1.5 line-clamp-2 text-[0.6875rem] text-(--ui-text-tertiary) font-mono',
+                                children: st.verb || (last?.preview ? last.preview.replace(A2A_PREFIX_RE, '').trim() : 'No activity yet')
+                              }),
+                              jsxs('div', {
+                                className: 'mt-1.5 flex items-center gap-1.5 text-[0.625rem] text-(--ui-text-quaternary)',
+                                children: [
+                                  jsxs('span', {
+                                    className: 'flex items-center gap-0.5',
+                                    title: 'Open loops — handoffs this bot sent that are still unanswered',
+                                    children: [jsx(Codicon, { name: 'sync', className: 'text-[0.7rem]' }), `${loops} open`]
+                                  }),
+                                  jsxs('span', {
+                                    className: 'flex items-center gap-0.5',
+                                    title: 'Approval queue depth (fleet-dispatch pending)',
+                                    children: [jsx(Codicon, { name: 'inbox', className: 'text-[0.7rem]' }), `${queued} queued`]
+                                  }),
+                                  last
+                                    ? jsx('span', { className: 'ml-auto', children: relativeTime(last.last_active * 1000) })
+                                    : null
+                                ]
+                              })
+                            ]
+                          },
+                          bot.name
+                        )
+                      })
+                    }),
+                    // Squad pipeline: interactive flow matrix + live stats.
+                    jsx(FleetMatrix, {
+                      matrix,
+                      roster,
+                      allMeta,
+                      onOpenBot: (bot, meta) => void openBotChat(bot, meta)
+                    }),
+                    // Timeline: newest event per bot, filtered by kind.
+                    jsxs('div', {
+                      className: 'mt-1',
+                      children: [
+                        jsxs('div', {
+                          className: 'flex items-center gap-1.5 px-0.5 pb-1 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+                          children: [jsx(Codicon, { name: 'history', className: 'text-[0.8rem]' }), 'Timeline']
+                        }),
+                        events.length
+                          ? jsx('div', {
+                              className: 'flex flex-col gap-px',
+                              children: events.map(event => {
+                                const botMeta = allMeta[event.bot.name] || {}
+                                const { shape, color, image } = botAppearance(event.bot.name, botMeta)
+
+                                return jsxs(
+                                  'button',
+                                  {
+                                    type: 'button',
+                                    className:
+                                      'flex w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)',
+                                    onClick: () => void openBotChat(event.bot, botMeta),
+                                    children: [
+                                      jsx(BotFace, { shape, color, image, size: 18, name: event.bot.name, mood: 'idle' }),
+                                      jsx('span', {
+                                        className: 'shrink-0 text-[0.625rem]',
+                                        title: event.kind,
+                                        children:
+                                          event.kind === 'bot_to_bot'
+                                            ? '🤖'
+                                            : event.kind === 'cron'
+                                              ? '🗓'
+                                              : '🧑'
+                                      }),
+                                      jsx('span', {
+                                        className: 'shrink-0 text-[0.6875rem] font-medium',
+                                        children: displayName(event.bot, botMeta)
+                                      }),
+                                      jsx('span', {
+                                        className: 'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                                        children: event.preview
+                                      }),
+                                      jsx('span', {
+                                        className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                                        children: relativeTime(event.ts * 1000)
+                                      })
+                                    ]
+                                  },
+                                  event.bot.name + event.ts
+                                )
+                              })
+                            })
+                          : jsx('div', {
+                              className: 'px-0.5 py-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+                              children: 'No events in this filter yet.'
+                            })
+                      ]
+                    })
+                  ]
+                })
+              })
+    ]
+  })
+}
+
+// ── squad workstream board (Phase 5) ─────────────────────────────────────────
+
+function TaskCard({ task, onOpenChat, onReview, allMeta = {} }) {
+  const meta = allMeta[task.botName] || {}
+  const { shape, color, image } = botAppearance(task.botName, meta)
+  const deliv = task.deliverable || { kind: 'task', icon: 'check', label: 'Deliverable' }
+
+  return jsxs('div', {
+    role: 'button',
+    tabIndex: 0,
+    onClick: () => onReview(task),
+    onKeyDown: e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        onReview(task)
+      }
+    },
+    className: cn(
+      'group/card flex flex-col gap-2 rounded-lg border p-2.5 transition-all text-left cursor-pointer select-none',
+      task.isUnread
+        ? 'border-amber-400/60 bg-amber-500/10 shadow-xs'
+        : 'border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#161618)/40 hover:border-(--ui-stroke-secondary)/90 hover:bg-(--chrome-action-hover)'
+    ),
+    children: [
+      // Top header: Bot identity + status dot + relative time
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-1.5',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-1.5 truncate',
+            children: [
+              jsx(BotFace, { shape, color, image, size: 20, name: task.botName, mood: task.isActiveNow ? 'work' : 'idle' }),
+              jsx('span', { className: 'font-mono text-[0.6875rem] font-semibold text-foreground truncate', children: `@${botHandle(task.botName)}` })
+            ]
+          }),
+          jsxs('div', {
+            className: 'flex shrink-0 items-center gap-1.5',
+            children: [
+              task.isActiveNow
+                ? jsx('span', { className: 'size-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]', title: 'Working now' })
+                : task.isUnread
+                  ? jsx('span', { className: 'size-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_#fbbf24]', title: 'Waiting for you' })
+                  : null,
+              jsx('span', { className: 'font-mono text-[0.625rem] text-(--ui-text-quaternary)', children: relativeTime(task.ts * 1000) })
+            ]
+          })
+        ]
+      }),
+
+      // Task Title
+      jsx('div', {
+        className: 'text-[0.8125rem] font-semibold leading-snug text-foreground line-clamp-2',
+        children: task.title
+      }),
+
+      // Status Verb line
+      jsx('div', {
+        className: 'text-[0.6875rem] text-(--ui-text-tertiary) truncate font-mono',
+        children: task.preview || 'No description'
+      }),
+
+      // Footer: Deliverable chip + 1 Primary Action
+      jsxs('div', {
+        className: 'flex items-center justify-between pt-1 border-t border-(--ui-stroke-secondary)/40 gap-1 mt-0.5',
+        children: [
+          jsxs('span', {
+            className: 'inline-flex items-center gap-1 rounded bg-(--chrome-action-hover) px-1.5 py-0.5 text-[0.625rem] font-mono text-(--ui-text-secondary)',
+            children: [
+              jsx(Codicon, { name: deliv.icon || 'check', className: 'text-[0.65rem] text-(--ui-accent,#4f9cf9)' }),
+              jsx('span', { children: deliv.label })
+            ]
+          }),
+          jsx('button', {
+            type: 'button',
+            className: cn(
+              'rounded px-2 py-0.5 text-[0.6875rem] font-semibold transition-colors',
+              task.isUnread
+                ? 'bg-amber-400 text-black hover:bg-amber-300'
+                : 'bg-(--ui-accent,#4f9cf9)/15 text-(--ui-accent,#4f9cf9) hover:bg-(--ui-accent,#4f9cf9)/25'
+            ),
+            onClick: e => {
+              e.stopPropagation()
+              onReview(task)
+            },
+            children: task.isUnread ? 'Review changes' : 'Open'
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function TaskReviewDrawer({ task, open, onClose, onOpenChat, allMeta = {} }) {
+  if (!open || !task) return null
+  const meta = allMeta[task.botName] || {}
+  const deliv = task.deliverable || { label: 'Deliverable', icon: 'check' }
+
+  return jsx(Dialog, {
+    open: Boolean(open),
+    onOpenChange: isOpen => { if (!isOpen) onClose() },
+    children: jsxs(DialogContent, {
+      className: 'max-w-xl p-0 overflow-hidden bg-background border border-(--ui-stroke-secondary) shadow-2xl',
+      children: [
+        jsxs(DialogHeader, {
+          className: 'px-4 pt-4 pb-3 border-b border-(--ui-stroke-secondary)',
+          children: [
+            jsxs('div', {
+              className: 'flex items-center gap-2',
+              children: [
+                jsx(Badge, { tone: task.isUnread ? 'warning' : 'accent', children: `@${botHandle(task.botName)}` }),
+                jsx(DialogTitle, { className: 'text-sm font-semibold truncate', children: task.title })
+              ]
+            }),
+            jsxs(DialogDescription, {
+              className: 'flex items-center gap-2 pt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)',
+              children: [
+                jsx('span', { children: `Kind: ${task.kind}` }),
+                jsx('span', { children: '·' }),
+                jsx('span', { children: `Updated: ${relativeTime(task.ts * 1000)}` })
+              ]
+            })
+          ]
+        }),
+        jsxs('div', {
+          className: 'flex flex-col gap-3 p-4 text-xs max-h-[60vh] overflow-y-auto',
+          children: [
+            jsxs('div', {
+              className: 'flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-3 bg-(--chrome-action-hover)/40',
+              children: [
+                jsx('span', { className: 'font-semibold uppercase tracking-wider text-[0.625rem] text-(--ui-text-quaternary)', children: 'Executive Summary / Finding' }),
+                jsx('p', { className: 'text-sm font-medium text-foreground leading-relaxed', children: task.preview || 'Task completed with no preview text.' })
+              ]
+            }),
+            jsxs('div', {
+              className: 'flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-3',
+              children: [
+                jsx('span', { className: 'font-semibold uppercase tracking-wider text-[0.625rem] text-(--ui-text-quaternary)', children: 'Target Deliverable' }),
+                jsxs('div', {
+                  className: 'flex items-center gap-2 font-mono text-xs text-(--ui-accent,#4f9cf9)',
+                  children: [
+                    jsx(Codicon, { name: deliv.icon || 'check' }),
+                    jsx('span', { className: 'font-semibold', children: deliv.label })
+                  ]
+                })
+              ]
+            })
+          ]
+        }),
+        jsxs(DialogFooter, {
+          className: 'px-4 py-3 border-t border-(--ui-stroke-secondary) flex items-center justify-between gap-2',
+          children: [
+            jsx(Button, {
+              variant: 'ghost',
+              size: 'sm',
+              onClick: onClose,
+              children: 'Done & Close'
+            }),
+            jsx(Button, {
+              size: 'sm',
+              onClick: () => {
+                onClose()
+                onOpenChat(task)
+              },
+              children: 'Open Session Chat ➔'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function SquadBoardPage() {
+  const { data, refetch } = useRoster()
+  const gatewayState = useValue(host.state.gateway)
+  const activeProfile = useValue(host.state.profile)
+  const unread = useValue($botUnread)
+  const allMeta = useValue($botMeta)
+  const [botFilter, setBotFilter] = useState('all')
+  const [query, setQuery] = useState('')
+  const [selectedTask, setSelectedTask] = useState(null)
+  const [showAllDone, setShowAllDone] = useState(false)
+
+  const roster = Array.isArray(data?.profiles) ? data.profiles : []
+  const columns = deriveWorkstreamTasks(
+    roster,
+    unread,
+    activeProfile,
+    gatewayState === 'busy',
+    Date.now() / 1000
+  )
+
+  const openTaskChat = async task => {
+    if (task.id && typeof host.openSession === 'function') {
+      try {
+        await host.openSession(task.id, { profile: task.botName })
+        return
+      } catch {
+        /* fallback below */
+      }
+    }
+    await openBotChat(task.bot || { name: task.botName }, allMeta[task.botName])
+  }
+
+  const columnConfig = [
+    { key: 'needs_review', title: 'Needs you', icon: 'eye', tone: 'text-amber-400' },
+    { key: 'in_progress', title: 'Working', icon: 'play', tone: 'text-emerald-400' },
+    { key: 'inbox', title: 'Queued', icon: 'inbox', tone: 'text-(--ui-text-tertiary)' },
+    { key: 'completed', title: 'Done', icon: 'check-all', tone: 'text-(--ui-accent,#4f9cf9)' }
+  ]
+
+  return jsxs('div', {
+    className: 'flex h-full w-full flex-col bg-background overflow-hidden',
+    children: [
+      // Board Header Bar
+      jsxs('div', {
+        className: 'flex shrink-0 items-center justify-between border-b border-(--ui-stroke-secondary) px-4 py-3 gap-3',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-3',
+            children: [
+              jsx('div', {
+                className: 'flex items-center gap-2',
+                children: [
+                  jsx('span', { className: 'text-base font-bold tracking-tight text-foreground', children: 'Tasks' }),
+                  jsx(Badge, { tone: 'neutral', children: `${roster.length} bots` })
+                ]
+              }),
+              // Bot Filter Tabs
+              jsxs('div', {
+                className: 'flex items-center gap-1 rounded-lg border border-(--ui-stroke-secondary) p-0.5 bg-(--ui-bg-secondary,#161618)/30',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: cn(
+                      'rounded-md px-2 py-1 text-[0.6875rem] font-medium transition-colors',
+                      botFilter === 'all' ? 'bg-(--chrome-action-hover) text-foreground shadow-xs' : 'text-(--ui-text-tertiary) hover:text-foreground'
+                    ),
+                    onClick: () => setBotFilter('all'),
+                    children: 'All bots'
+                  }),
+                  roster.map(b =>
+                    jsx(
+                      'button',
+                      {
+                        type: 'button',
+                        className: cn(
+                          'rounded-md px-2 py-1 font-mono text-[0.6875rem] font-medium transition-colors',
+                          botFilter === b.name ? 'bg-(--chrome-action-hover) text-foreground shadow-xs' : 'text-(--ui-text-tertiary) hover:text-foreground'
+                        ),
+                        onClick: () => setBotFilter(b.name),
+                        children: `@${botHandle(b.name)}`
+                      },
+                      b.name
+                    )
+                  )
+                ]
+              })
+            ]
+          }),
+
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx(SearchField, {
+                placeholder: 'Filter tasks…',
+                value: query,
+                onChange: setQuery,
+                containerClassName: 'w-48'
+              }),
+              jsx(Button, {
+                variant: 'ghost',
+                size: 'sm',
+                onClick: () => {
+                  void refetch()
+                  haptic('tap')
+                },
+                children: 'Refresh'
+              })
+            ]
+          })
+        ]
+      }),
+
+      // Responsive Board Grid
+      jsx('div', {
+        className: 'grid flex-1 grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 p-4 overflow-y-auto min-h-0 bg-(--ui-bg-secondary,#161618)/10',
+        children: columnConfig.map(col => {
+          const rawTasks = columns[col.key] || []
+          const filtered = filterBoardTasks(rawTasks, botFilter, query)
+          const isDone = col.key === 'completed'
+          const displayTasks = isDone && !showAllDone ? filtered.slice(0, 3) : filtered
+
+          return jsxs(
+            'div',
+            {
+              className: 'flex flex-col rounded-xl border border-(--ui-stroke-secondary) bg-card/60 p-3 shadow-xs',
+              children: [
+                // Column Header
+                jsxs('div', {
+                  className: 'flex shrink-0 items-center justify-between pb-2 mb-2 border-b border-(--ui-stroke-secondary)/60',
+                  children: [
+                    jsxs('div', {
+                      className: 'flex items-center gap-1.5',
+                      children: [
+                        jsx(Codicon, { name: col.icon, className: cn('text-xs', col.tone) }),
+                        jsx('span', { className: 'text-xs font-semibold text-foreground', children: col.title })
+                      ]
+                    }),
+                    jsx('span', {
+                      className: 'rounded-full bg-(--chrome-action-hover) px-1.5 py-px font-mono text-[0.625rem] font-medium text-(--ui-text-tertiary)',
+                      children: String(filtered.length)
+                    })
+                  ]
+                }),
+
+                // Column Tasks List
+                jsxs('div', {
+                  className: 'flex flex-col gap-2',
+                  children: [
+                    displayTasks.length === 0
+                      ? jsx('div', {
+                          className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary)/60 p-4 text-center text-xs text-(--ui-text-quaternary)',
+                          children: 'No tasks'
+                        })
+                      : displayTasks.map(task =>
+                          jsx(
+                            TaskCard,
+                            {
+                              task,
+                              onOpenChat: openTaskChat,
+                              onReview: setSelectedTask,
+                              allMeta
+                            },
+                            task.id
+                          )
+                        ),
+                    isDone && filtered.length > 3
+                      ? jsx('button', {
+                          type: 'button',
+                          className: 'text-center py-1.5 text-[0.6875rem] font-mono text-(--ui-accent,#4f9cf9) hover:underline rounded bg-(--chrome-action-hover)/40 hover:bg-(--chrome-action-hover)',
+                          onClick: () => setShowAllDone(prev => !prev),
+                          children: showAllDone
+                            ? 'Collapse older completed tasks ▴'
+                            : `+${filtered.length - 3} older completed tasks (click to expand) ▾`
+                        })
+                      : null
+                  ]
+                })
+              ]
+            },
+            col.key
+          )
+        })
+      }),
+
+      // Review Modal Drawer
+      jsx(TaskReviewDrawer, {
+        task: selectedTask,
+        open: Boolean(selectedTask),
+        allMeta,
+        onClose: () => setSelectedTask(null),
+        onOpenChat: openTaskChat
+      })
+    ]
+  })
+}
+
+// ── tool execution pills ──────────────────────────────────────────────────────
+// Lightweight collapsible pills for tool executions in chat streams: a status
+// dot, a codicon, a one-line summary, and an elapsed timer. Pure functions —
+// no dependencies, no timers — so rendering stays instant and testable.
+
+const TOOL_PILL_ICONS = {
+  terminal: 'terminal',
+  bash: 'terminal',
+  read_file: 'file-code',
+  write_file: 'file-add',
+  patch: 'diff',
+  edit: 'edit',
+  web_search: 'globe',
+  web_extract: 'globe',
+  rag_query: 'database',
+  execute_code: 'code'
+}
+
+function formatToolDuration(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return '0s'
+  if (seconds < 60) {
+    const tenths = Math.round(seconds * 10) / 10
+    return `${tenths}s`
+  }
+  const minutes = Math.floor(seconds / 60)
+  const rest = Math.round(seconds % 60)
+  return `${minutes}m ${String(rest).padStart(2, '0')}s`
+}
+
+function toolArgBrief(toolName, args) {
+  if (!args || typeof args !== 'object') return '…'
+  const pick = args.command ?? args.path ?? args.query ?? args.url ?? args.goal
+  if (typeof pick === 'string' && pick.trim()) {
+    return pick.length > 72 ? `${pick.slice(0, 72)}…` : pick
+  }
+  // Fall back to the first string value in the args bag.
+  for (const value of Object.values(args)) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.length > 72 ? `${value.slice(0, 72)}…` : value
+    }
+  }
+  return '…'
+}
+
+function formatToolSummary(toolName, args = {}, duration = 0) {
+  const name = String(toolName || 'tool')
+  return {
+    icon: TOOL_PILL_ICONS[name] || 'tools',
+    label: `${name}: ${toolArgBrief(name, args)}`,
+    duration: formatToolDuration(duration)
+  }
+}
+
+function StatusDot({ tone = 'success', className = '' }) {
+  const tones = {
+    success: 'bg-(--ui-success)',
+    running: 'bg-(--ui-accent) animate-pulse',
+    error: 'bg-(--ui-danger)',
+    idle: 'bg-(--ui-text-quaternary)'
+  }
+  const dotClass = tones[tone] || tones.idle
+  return jsx('span', {
+    className: `inline-block h-1.5 w-1.5 shrink-0 rounded-full ${dotClass} ${className}`,
+    'data-tone': tone
+  })
+}
+
+function ToolPill({
+  toolName,
+  args = {},
+  duration = 0,
+  status = 'success',
+  expanded = false,
+  onToggle
+}) {
+  const [open, setOpen] = useState(expanded)
+  const isOpen = expanded !== undefined ? expanded : open
+  const summary = formatToolSummary(toolName, args, duration)
+  const tone = status === 'running' ? 'running' : status === 'error' ? 'error' : 'success'
+
+  return jsx('div', {
+    className: 'hermes-bots-tool-pill flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg) px-2 py-1',
+    children: [
+      jsx('button', {
+        type: 'button',
+        onClick: () => (onToggle ? onToggle(!isOpen) : setOpen(!isOpen)),
+        className: 'flex min-w-0 flex-1 items-center gap-1.5 text-left',
+        children: [
+          jsx(StatusDot, { tone }),
+          jsx(Codicon, { name: summary.icon, className: 'shrink-0 text-[0.8rem] text-(--ui-text-secondary)' }),
+          jsx('span', {
+            className: 'min-w-0 flex-1 truncate font-mono text-[0.75rem] text-(--ui-text-secondary)',
+            children: summary.label
+          }),
+          jsx('span', {
+            className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: summary.duration
+          }),
+          jsx(Codicon, { name: isOpen ? 'chevron-down' : 'chevron-right', className: 'shrink-0 text-[0.7rem] text-(--ui-text-quaternary)' })
+        ]
+      }),
+      isOpen
+        ? jsx('div', {
+            className: 'overflow-x-auto whitespace-pre font-mono text-[0.6875rem] text-(--ui-text-tertiary)',
+            children: JSON.stringify(args, null, 2)
+          })
+        : null
+    ]
+  })
+}
+
 // ── plugin ───────────────────────────────────────────────────────────────────
 
 export default {
@@ -4474,6 +7018,19 @@ export default {
         .then(value => {
           if (value && typeof value === 'object') {
             $botMeta.set(value)
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage on this shell — defaults stay */
+    }
+
+    // Hydrate pinned sessions (same normalization as bot-meta).
+    try {
+      Promise.resolve(ctx.storage?.get?.('pinned-sessions'))
+        .then(value => {
+          if (value && typeof value === 'object') {
+            $pinnedSessions.set(value)
           }
         })
         .catch(() => undefined)
@@ -4511,6 +7068,57 @@ export default {
       render: () => jsx(RoutinesPane, {})
     })
 
+    // Fleet — command center tile, docked like Routines: its own tiling
+    // pane splitting the workspace's right edge.
+    ctx.register({
+      id: 'fleet',
+      area: 'panes',
+      title: 'Fleet',
+      data: {
+        placement: 'main',
+        dock: { pane: 'workspace', pos: 'right' },
+        width: '250px'
+      },
+      render: () => jsx(FleetPage, {})
+    })
+
+    // Full Squad Workstream Board page — accessible at /board and in sidebar nav
+    if (typeof ROUTES_AREA !== 'undefined') {
+      ctx.register({
+        id: 'squad-board-route',
+        area: ROUTES_AREA,
+        data: { path: '/board' },
+        render: () => jsx(SquadBoardPage, {})
+      })
+    }
+
+    if (typeof SIDEBAR_NAV_AREA !== 'undefined') {
+      ctx.register({
+        id: 'squad-board-nav',
+        area: SIDEBAR_NAV_AREA,
+        data: {
+          path: '/board',
+          label: 'Squad Board',
+          codicon: 'project'
+        }
+      })
+    }
+
+    ctx.register({
+      id: 'open-squad-board',
+      area: PALETTE_AREA,
+      data: {
+        id: `${ID}.open-squad-board`,
+        label: 'Open Squad Board…',
+        keywords: ['board', 'squad', 'kanban', 'tasks', 'fleet', 'workstream'],
+        run: () => {
+          if (typeof host.navigate === 'function') {
+            host.navigate('/board')
+          }
+        }
+      }
+    })
+
     ctx.register({
       id: 'new-agent',
       area: PALETTE_AREA,
@@ -4523,6 +7131,16 @@ export default {
         }
       }
     })
+
+    // ⌘K fast-dispatch: one "Ask @<bot>…" row per live roster bot. The
+    // roster loads async, so register now (whatever is known) and keep the
+    // rows in step as the poll refreshes it. Guarded: the palette surface
+    // and the atom's listen may be absent on some shells.
+    syncBotPaletteActions()
+
+    if (typeof $lastRoster.listen === 'function') {
+      $lastRoster.listen(() => syncBotPaletteActions())
+    }
 
     // @-mention middleware: "@<bot> do the thing" in any chat becomes an
     // explicit handoff instruction the active agent's SOUL.md knows how to
@@ -4600,12 +7218,28 @@ export default {
           // recipient's canonical Bot Chat, so their side reads as a normal
           // DM (message bubble + their reply), and the reply prints on
           // stdout for the sender to relay.
+          // Paused bots don't dispatch handoffs — the human paused them on
+          // purpose. The mention stays as plain text; the handoff note is
+          // withheld so the bot won't send anything.
           const activeMeta = $botMeta.get()[active]
+
+          if (activeMeta?.paused) {
+            host.notify({
+              kind: 'info',
+              title: `${displayName({ name: active, title: activeMeta?.title }, activeMeta)} is paused`,
+              message: 'Handoff not dispatched — resume the bot in the Bots pane to send tasks.'
+            })
+            return draft
+          }
+
           const senderName = displayName({ name: active, title: activeMeta?.title }, activeMeta)
           const note =
             '\n\n[@mention handoff — for each mentioned agent (' + mentioned.map(botHandle).join(', ') + '): ' +
             'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim. Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-            mentioned.map(n => '`hermes -p ' + n + ' chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + senderName + ' (@' + botHandle(active) + '): <your composed message>"`').join('\n') +
+            mentioned.map(n => '`' + fleetDispatchCommand(botHandle(active), n, '<your composed message>') + '`').join('\n') +
+            '\nIf `fleet-dispatch` is not installed, fall back to `' +
+            mentioned.map(n => rawChatCommand(botHandle(active), n, '<your composed message>')).join('` or `') +
+            '`. ' +
             '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. If it fails with "No session found matching \'Bot Chat\'", send once without the -c flag, then run `hermes -p <agent> sessions rename <session_id from the output> "Bot Chat"`. ' +
             'Relay the reply back to the user, attributed to that agent.]'
 

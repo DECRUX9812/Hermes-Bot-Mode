@@ -17,6 +17,11 @@ A **desktop-app plugin** for [Hermes Agent](https://github.com/NousResearch/herm
 - **Routines pane** — recurring tasks per bot, backed by Hermes cron. "Summarize my inbox every morning" lives next to the bot that does it. Runs land in the bot's own chat history.
 - **Bot-to-bot messaging** — every bot has a persistent **Agent Inbox** conversation. Bots message each other with attribution (`[Message from agent 'researcher']`), and their SOUL.md teaches them the protocol, including how to reply.
 - **@mentions** — type `@researcher have a look at this` in any chat and the active bot hands the message off, waits for the reply, and reports back.
+- **Fleet page** — a command-center pane over the whole roster: per-bot status grid (busy / idle / muted / paused), cross-bot search, and one-line previews of recent handoffs.
+- **Handoffs feed + Needs-you inbox** — every handoff a bot sends is written to a durable ledger. Open loops (sent, not yet replied) show as badges on the sender's row, and anything awaiting *you* — replies to relay, failed handoffs — lands in a Needs-you inbox that routes you to the right chat.
+- **Pause / Mute per bot** — right-click a bot: **Pause** blocks all handoff dispatch (in-app and via `fleet-dispatch`); **Mute** keeps the bot working but silences its notifications.
+- **Daily fleet digest** — `scripts/fleet-digest` composes a markdown Fleet report (per bot: actions, handoffs sent/received, open loops, needs-you items) straight from each profile's session store. Zero npm deps, no gateway needed — safe for cron.
+- **Fleet dispatch CLI** — `scripts/fleet-dispatch` wraps every bot-to-bot send with policy enforcement: pause gate, approval gate, and per-bot rate limits, with a durable ledger of who tried to send what and what happened.
 
 ## How it works
 
@@ -44,6 +49,54 @@ No core patches, no background daemons, no extra storage: everything is standard
 
 <img width="1313" height="612" alt="image" src="https://github.com/user-attachments/assets/c45b1e96-4362-4462-a049-ba8c44b87bed" />
 
+## Fleet dispatch CLI
+
+`scripts/fleet-dispatch` is the enforcement wrapper in front of every bot-to-bot send. It applies fleet policy before the message ships, and records every attempt in a durable ledger:
+
+```bash
+fleet-dispatch send <to> "<message>" --as <sender>   # send, subject to policy
+fleet-dispatch approve <id>                           # approve a queued send
+fleet-dispatch reject <id>                            # reject a queued send
+fleet-dispatch status                                 # policy summary + last 10 ledger events
+```
+
+Gates, in order: **paused sender** → refused; **approval gate** (`require_approval` in policy) → queued, prints `approve <id>` / `reject <id>`; **rate limit** (`max_per_hour`) → refused when exceeded. Ledger entries record who tried to send what, and whether it shipped, was queued, or was refused — `status` shows the last 10.
+
+Approvals are **fail-closed with a closed outcome set** and a **log-only audit pair** (deepseek-harness approval.md semantics): the ask appends `approval/asked` with a `requestId`; the decision appends `approval/decided` with the same `requestId` and one of `allowed-once | rejected | cancelled | unavailable` — approve → `allowed-once`, reject → `rejected`, approve-refused (sender paused since queue) → `cancelled`, missing pending item → `unavailable` (never an open gate). Ledger events never enter the model transcript; the only model-visible artifact is the send payload itself. `require_approval: "never"` refuses deterministically **before** the answerer waterfall — no queue, no prompt, and a later answerer cannot bypass it (the strict headless stance, like the `danger-full-access → never` preset).
+
+### Policy
+
+Fleet policy lives at `~/.hermes/fleet/policy.json` (template: `scripts/fleet-policy.json.example`):
+
+```json
+{
+  "quiet_hours": { "enabled": false, "start": "22:00", "end": "07:00" },
+  "default_max_per_hour": 30,
+  "bots": {
+    "trader": { "max_per_hour": 10 },
+    "scribe": { "require_approval": false }
+  }
+}
+```
+
+- `quiet_hours` — `fleet-dispatch` refuses sends outside the allowed window when enabled.
+- `default_max_per_hour` — default send throttle per bot.
+- `bots.<name>` — per-bot overrides: `max_per_hour` throttle, `require_approval` gate (defaults to on for bots that need a human in the loop; accepts `true`/`ask` to queue for human approval, or `"never"` to refuse deterministically with no prompt).
+
+The plugin reads the same `ui_meta` flags as the CLI, so Pause/Mute set in the app are enforced by `fleet-dispatch` too.
+
+### Daily digest
+
+`scripts/fleet-digest` [--window-hours 24] [--profiles a,b,c] composes the markdown Fleet report from each profile's SQLite session store (read-only, via `node:sqlite` with zero-dep fallbacks). No npm packages, no gateway — wire it to cron for a morning Fleet report.
+
+## Testing
+
+```bash
+node --test tests/*.test.mjs
+```
+
+> **Gotcha:** the directory form `node --test tests/` fails — the test files import from `../scripts/` and need explicit glob expansion. Always use the glob form above.
+
 ## Install
 
 > **This is a desktop plugin** — it must be installed on the machine running the **Hermes desktop app**, not on the gateway. Desktop plugins load from the app-side `~/.hermes/desktop-plugins/` directory; if you use a remote/SSH gateway, installing on the gateway box does nothing. (Example: gateway on your homelab, desktop app on your MacBook → install on the MacBook.)
@@ -54,6 +107,8 @@ git clone https://github.com/NousResearch/Hermes-Bot-Mode ~/.hermes/desktop-plug
 
 (or download `plugin.js` into `~/.hermes/desktop-plugins/hermes-bots/`)
 
+The fleet tooling lives in `scripts/` — symlink `fleet-dispatch` and `fleet-digest` onto your PATH (e.g. `~/.local/bin/`) so the wrapper is callable, and copy `scripts/fleet-policy.json.example` to `~/.hermes/fleet/policy.json` to tune policy. The plugin falls back to raw chat handoffs when `fleet-dispatch` is not installed.
+
 Then reload plugins in the Hermes desktop app (Ctrl+K → "Reload desktop plugins") or restart the app. A **Bots** tab appears next to Sessions, and a **Routines** tile docks beside the conversation.
 
 ### Requirements
@@ -63,7 +118,7 @@ Then reload plugins in the Hermes desktop app (Ctrl+K → "Reload desktop plugin
 
 ## Notes
 
-- Bot-to-bot delivery is per-invocation (the receiving bot sees the message in its inbox when it next runs); live interrupt of a mid-conversation bot is upstream future work.
+- Bot-to-bot delivery is policy-gated: `fleet-dispatch` enforces pause/mute, approval, and rate limits before any send; the receiving bot sees the message in its inbox when it next runs. Live interrupt of a mid-conversation bot is upstream future work.
 - Avatar/pet customizations are stored in plugin storage; the profile itself stays clean.
 
 ## License

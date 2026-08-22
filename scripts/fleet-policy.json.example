@@ -1,0 +1,8 @@
+{
+  "quiet_hours": { "enabled": false, "start": "22:00", "end": "07:00" },
+  "default_max_per_hour": 30,
+  "bots": {
+    "trader": { "max_per_hour": 10 },
+    "scribe": { "require_approval": false }
+  }
+}

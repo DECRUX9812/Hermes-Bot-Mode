@@ -27,6 +27,7 @@ function renderBotRow(name = 'alpha') {
   const node = (type, props = {}) => ({ type, props })
   const context = {
     BotFace: 'BotFace',
+    Codicon: 'Codicon',
     ContextMenu: 'ContextMenu',
     ContextMenuContent: 'ContextMenuContent',
     ContextMenuItem: 'ContextMenuItem',
@@ -37,6 +38,7 @@ function renderBotRow(name = 'alpha') {
     $botUnread: atom({}),
     $lastRoster: atom([]),
     $selectedBot: atom('default'),
+    $pinnedSessions: atom({}),
     botAppearance: () => ({ shape: 'round', color: '#000', image: null }),
     botHandle: value => value,
     cn: (...values) => values.filter(Boolean).join(' '),
@@ -65,7 +67,8 @@ function renderBotRow(name = 'alpha') {
     relativeTime: () => 'now',
     saveBotMeta: () => undefined,
     showsHandle: () => false,
-    useValue: store => store.get()
+    useValue: store => store.get(),
+    unifiedBotState: () => ({ state: 'idle', label: 'Idle', verb: '', cls: '' })
   }
 
   vm.runInNewContext(`${botRowSource}\nglobalThis.BotRow = BotRow`, context)
